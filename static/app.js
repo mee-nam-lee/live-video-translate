@@ -149,7 +149,6 @@
     // Its output goes only to the capture worklet (never to the speakers).
     playoutDelay: 0,
     subtitleExtraDelay: 0, // seconds, applied to transcription events after arrival
-    dubExtraDelay: 0, // seconds, applied to translated audio scheduling
     subtitleTimers: new Set(),
     feeder: null,
     feederSourceNode: null,
@@ -298,13 +297,9 @@
       const num = (v, max) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.min(Number(v), max) : 0);
       state.playoutDelay = num(cfg.playout_delay_seconds, 10);
       state.subtitleExtraDelay = num(cfg.subtitle_extra_delay_seconds, 5);
-      state.dubExtraDelay = num(cfg.dubbing_extra_delay_seconds, 5);
       if (dom.playoutDelayTag) {
-        const parts = [
-          state.playoutDelay > 0 ? `송출 지연 ${state.playoutDelay.toFixed(1)}s` : "송출 지연 없음",
-          `자막 +${state.subtitleExtraDelay.toFixed(1)}s`,
-          `더빙 +${state.dubExtraDelay.toFixed(1)}s`,
-        ];
+        const parts = [state.playoutDelay > 0 ? `송출 지연 ${state.playoutDelay.toFixed(1)}s` : "송출 지연 없음"];
+        if (state.subtitleExtraDelay > 0) parts.push(`자막 +${state.subtitleExtraDelay.toFixed(1)}s`);
         dom.playoutDelayTag.textContent = parts.join(" · ");
       }
     } catch (err) {
@@ -1089,8 +1084,7 @@
     src.connect(state.targetGain);
 
     const now = ctx.currentTime;
-    // Extra dubbing delay shifts the whole translated-audio stream (contiguity is preserved)
-    const startAt = Math.max(now + 0.02 + state.dubExtraDelay, state.nextPlayTime);
+    const startAt = Math.max(now + 0.02, state.nextPlayTime);
     src.start(startAt);
     state.nextPlayTime = startAt + audioBuffer.duration;
     if (isSpeech) {
@@ -1485,7 +1479,6 @@
       targetLines: state.targetLines.length,
       playoutDelay: state.playoutDelay,
       subtitleExtraDelay: state.subtitleExtraDelay,
-      dubExtraDelay: state.dubExtraDelay,
       holding: state.holding,
       feederTime: state.feeder ? state.feeder.currentTime : null,
       videoTime: dom.video.currentTime,
