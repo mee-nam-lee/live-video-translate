@@ -40,12 +40,31 @@ LIVE_TRANSLATE_MODEL: str = (
     os.getenv("LIVE_TRANSLATE_MODEL", "gemini-3.5-live-translate-preview").strip()
     or "gemini-3.5-live-translate-preview"
 )
-SUMMARY_MODEL: str = (
-    os.getenv("SUMMARY_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
-)
 INACTIVITY_TIMEOUT_SECONDS: int = int(
     os.getenv("INACTIVITY_TIMEOUT_SECONDS", "600").strip() or "600"
 )
+
+# Video source: GCS bucket name (without gs://). Empty = serve from local videos/ folder.
+VIDEOS_GCS_BUCKET: str = os.getenv("VIDEOS_GCS_BUCKET", "").strip().replace("gs://", "").strip("/")
+# Optional object prefix inside the bucket (e.g. "videos"). Empty = bucket root.
+VIDEOS_GCS_PREFIX: str = os.getenv("VIDEOS_GCS_PREFIX", "").strip().strip("/")
+
+# Translated-speech voice presets exposed in the settings UI.
+# "auto" omits speech_config so the model uses its default behaviour (speaker voice replication).
+# The remaining entries are the standard Live API prebuilt voices; the Live Translate preview
+# accepts speech_config without error, but actual voice change is subject to model support.
+SUPPORTED_VOICES = [
+    {"id": "auto", "name": "자동 (화자 음성 복제)", "description": "원 화자의 목소리를 따라 번역 음성을 생성합니다."},
+    {"id": "Puck", "name": "Puck", "description": "경쾌한 중성 음성"},
+    {"id": "Charon", "name": "Charon", "description": "차분한 저음 음성"},
+    {"id": "Kore", "name": "Kore", "description": "또렷한 여성 음성"},
+    {"id": "Fenrir", "name": "Fenrir", "description": "힘 있는 남성 음성"},
+    {"id": "Aoede", "name": "Aoede", "description": "부드러운 여성 음성"},
+    {"id": "Leda", "name": "Leda", "description": "밝은 여성 음성"},
+    {"id": "Orus", "name": "Orus", "description": "안정적인 남성 음성"},
+    {"id": "Zephyr", "name": "Zephyr", "description": "자연스러운 중성 음성"},
+]
+VALID_VOICE_IDS = {v["id"] for v in SUPPORTED_VOICES}
 
 # Simple shared-password login gate (set APP_LOGIN_PASSWORD in .env). Empty = login disabled.
 APP_LOGIN_PASSWORD: str = os.getenv("APP_LOGIN_PASSWORD", "").strip()

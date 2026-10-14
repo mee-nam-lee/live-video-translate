@@ -1,85 +1,106 @@
-# Google Gemini 3.5 Live Translate Application
+# Google Gemini 3.5 Live Video Translate
 
-`gemini-3.5-live-translate-preview` 모델과 Google GenAI SDK (`google-genai`)를 활용하여 구현한 **실시간 자막 통역(Live Transcript Translation)** 반응형 웹 애플리케이션입니다. 데스크톱 웹과 iPhone / Android 모바일 브라우저에서 별도 앱 설치 없이 동작합니다.
+`gemini-3.5-live-translate-preview` 모델과 Google GenAI SDK (`google-genai`)를 활용한 **비디오 실시간 번역(자막 + 더빙 음성)** 웹 애플리케이션입니다.
+GCS 버킷에 등록된 비디오를 선택해 재생하면 음성 언어를 자동 감지하고, 번역 자막을 영상 위에 오버레이로 표시하며 번역 음성을 원문 음성과 믹싱해 재생합니다.
+
+![Gemini Live Video Translate — 농구 중계 영상을 한국어로 실시간 번역 중](docs/screenshot-video-translate.png)
 
 ---
 
 ## 🖥️ 화면 구성
 
-<table>
-  <tr>
-    <th width="70%">데스크톱 웹 (대기 상태)</th>
-    <th width="30%">모바일 웹 — iPhone Chrome (통역 중)</th>
-  </tr>
-  <tr>
-    <td><img src="docs/screenshot-main.png" alt="데스크톱 메인 화면" /></td>
-    <td><img src="docs/screenshot-mobile.png" alt="iPhone Chrome 통역 중 화면" /></td>
-  </tr>
-</table>
-
 | 영역 | 설명 |
 | :--- | :--- |
-| **상단 헤더** | 세션 상태(`대기 중` / `실시간 통역 중` + 경과 시간 / 재연결 중), `회의 요약`(.md 회의록 즉시 저장), `원문/번역문 저장`(.md 기록 즉시 저장), 기록 초기화, 로그아웃 — 모바일에서는 아이콘만 표시 |
-| **언어 컨트롤 바** | Source 언어(자동 감지 시 감지 언어 배지 표시) ⇄ Target 언어 선택, `통역 시작` / `통역 종료` 버튼 (통역 중에는 빨간색 + 입력 레벨 이퀄라이저 표시, 모바일에서는 전체 폭) |
-| **Source 패널 (위)** | 인식된 원문이 문장 단위로 실시간 표시 (진행 중 문장은 파란색). `복사`, `접기`(접으면 최신 한 줄만 미리보기로 남고 Target 패널이 확장) |
-| **Target 패널 (아래)** | 번역문이 문장 단위로 실시간 표시 (진행 중 문장은 초록색). `복사` |
+| **상단 헤더** | 세션 상태 (`대기 중` / `세션 연결 중` / `실시간 번역 중` / `일시정지` / `번역 완료`), 비디오 목록 토글, 설정 ⚙️, 로그아웃 |
+| **좌측 사이드바** | GCS 버킷의 `videos.json`에 정의된 비디오 목록. 클릭 시 재생 + 번역 세션 시작 |
+| **플레이어** | 기본 HTML5 `<video controls>` + **번역 자막 오버레이 (최대 2줄, 전체화면에서도 표시)**. 설정에서 원문 자막 동시 표시 가능 |
+| **컨트롤 바** | 감지된 원문 언어 배지 → Target 언어 선택(78개), **원문 볼륨 (기본 10%)**, **번역 음성 볼륨 (기본 100%)**, 음소거 버튼 |
+| **설정 모달** | 번역 음성 선택, 자동 더킹(기본 OFF), 원문 동시 표시, 자막 크기(소/중/대), `echo_target_language` |
 
-> 모바일 브라우저에서는 HTTPS(Cloud Run 배포 URL)로 접속해야 마이크 권한이 허용됩니다.
+> 모든 설정과 볼륨·타겟 언어·마지막 선택 비디오는 `localStorage`에 저장되어 재방문 시 복원됩니다.
 
 ---
 
 ## ✨ 주요 기능
 
-1. **Gemini 3.5 Live Translate 전용 모델 연동 (`gemini-3.5-live-translate-preview`)**
-   - `echo_target_language=True` 기본 활성화 (입력 음성이 이미 Target 언어인 경우 번역 대신 원어 그대로 전사)
-   - `input_audio_transcription` 및 `output_audio_transcription` 동시 스트리밍
-   - 16kHz 16-bit Mono PCM 마이크 입력을 WebSocket으로 서버에 스트리밍
-2. **자막 전용 실시간 통역**
-   - 회의실/강연장 등에서 하울링 없이 사용할 수 있도록 **음성 출력 없이 자막(원문/번역문)만 실시간 표시**합니다.
-   - `통역 시작` 버튼 하나로 마이크 캡처와 통역 세션을 시작/종료합니다.
-3. **Source / Target 언어 설정 및 양방향 전환 (`⇄`)**
-   - **Source Language**: 기본값 `English (en)` + `🌐 자동 감지` + 공식 지원 **78개 전체 언어(BCP-47)** (자동 감지 시 실시간 감지 언어 배지 표시)
-   - **Target Language**: 기본값 `Korean (ko)` + 공식 지원 **78개 전체 언어(BCP-47)**
-   - 통역 진행 중 언어를 변경하거나 `⇄` 스왑 버튼을 누르면 마이크를 끄지 않고도 백엔드에서 세션을 무중단 재연결합니다.
-4. **Live API 세션 관리 (장시간 연속 통역 지원)**
-   - `ContextWindowCompressionConfig(sliding_window=SlidingWindow())`: 장시간 통역 시 토큰 한계 방지
-   - `SessionResumptionConfig(handle=...)` 및 `GoAway` 메시지 감지: 연결 수명 만료 전후로 세션 핸들을 이용해 끊김 없이 자동 재연결
-   - 모바일 백그라운드 전환/네트워크 끊김 후 `session_id` 기반 자동 복구, 10분 무음 시 자동 종료
-5. **원클릭 회의록 / 기록 저장 (`.md`)**
-   - **`회의 요약`**: 누적된 대화를 바탕으로 `핵심 주제·개요 / 안건별 논의 사항 / 결정 사항·Action Items` 구조의 회의록을 생성하여 즉시 `.md` 파일로 저장 (`POST /api/summarize`). 요약 길이는 원본 분량에 비례해 자동 조절되며, STT 오인식 가능성이 있는 약어는 임의로 풀이하지 않습니다.
-   - **`원문/번역문 저장`**: 전체 원문(Source) → 전체 번역문(Target) 순으로 분리 기록된 `.md` 파일을 즉시 저장
-
+1. **Gemini 3.5 Live Translate 연동 (`gemini-3.5-live-translate-preview`)**
+   - 입력: 비디오 오디오를 Web Audio API로 캡처 → 16kHz 16-bit Mono PCM → WebSocket 스트리밍
+   - 출력: 번역 음성(24kHz PCM, WebSocket 바이너리 프레임) + `input/output_audio_transcription` 자막
+   - 소스 언어는 모델이 자동 감지 (컨트롤 바에 감지 언어 배지 표시)
+2. **독립적인 오디오 믹싱**
+   - `createMediaElementSource` → `videoGain`(영상별 보정) → `sourceGain`(원문) / 서버 수신 PCM → `targetGain`(번역) 으로 완전히 분리된 볼륨 제어
+   - **자동 더킹(선택)**: 번역 음성이 실제로 발화 중인 구간(무음 패킷 제외)에만 원문 볼륨을 50%로 추가 감쇠
+3. **자막 오버레이**
+   - 번역문을 문장 단위로 실시간 갱신, 최대 2줄 유지 (오래된 문장부터 제거, 긴 문장은 앞부분을 `…`로 잘라냄)
+   - 옵션으로 원문을 작은 글씨로 함께 표시
+4. **재생과 세션 연동**
+   - 비디오 선택 시 세션 연결, **재생 중에만** 오디오 전송, 일시정지 시 전송 중단(세션 유지)
+   - 탐색(seek)·비디오 변경·타겟 언어/음성 변경 시 세션 재연결 + 자막/오디오 버퍼 초기화
+   - 영상 종료 후 남은 번역 음성이 끝날 때까지 대기한 뒤 세션 종료
+5. **GCS 기반 비디오 저장소**
+   - 비디오 파일과 `videos.json`을 GCS 버킷(`VIDEOS_GCS_BUCKET`)에서 읽어 **8 MiB 단위 206 Partial Content**로 스트리밍 (Cloud Run의 32 MiB 단일 응답 제한 회피, 탐색 지원)
+   - 환경변수가 비어 있으면 로컬 `videos/` 폴더로 폴백
+6. **세션 관리**: `ContextWindowCompressionConfig`, `SessionResumptionConfig`, `GoAway` 자동 재연결, 무입력 자동 종료
+7. **로그인 게이트**: 공유 비밀번호 + HMAC 서명 쿠키. `/media/*`, `/api/*`도 로그인 없이는 접근 불가
 
 ---
 
 ## 📁 프로젝트 구조
 
 ```text
-live-translate/
+live-translate-video/
 ├── app/
-│   ├── __init__.py
-│   ├── config.py          # 환경변수(.env), ADC/API Key 클라이언트 팩토리, 로그인 설정, 78개 지원 언어 정의
-│   └── main.py            # FastAPI 서버, 로그인 게이트, /ws/translate 양방향 스트리밍, 세션 관리, /api/summarize
+│   ├── config.py          # 환경변수, GenAI 클라이언트 팩토리, 78개 언어, 음성 프리셋, GCS 설정
+│   └── main.py            # FastAPI 서버, 로그인 게이트, /api/videos, /media 범위 스트리밍, /ws/translate
 ├── static/
-│   ├── index.html         # 반응형 웹/모바일 UI (상: Source, 하: Target)
-│   ├── login.html         # 로그인 화면
-│   ├── styles.css         # Google 4-Color (#4285F4, #EA4335, #FBBC05, #34A853) + 화이트 테마
-│   └── app.js             # Web Audio API 16kHz 캡처, WebSocket 스트리밍, 자동 스크롤, .md 저장
+│   ├── index.html         # 사이드바 + 플레이어 + 자막 오버레이 + 컨트롤 바 + 설정 모달
+│   ├── login.html
+│   ├── styles.css         # Google 4-Color 화이트 테마
+│   └── app.js             # Web Audio 캡처/재생, WebSocket, 자막, 더킹, 설정 저장
+├── videos/
+│   ├── videos.json        # 비디오 목록 메타데이터 (git 추적, GCS에 동일 파일 업로드)
+│   └── *.mp4              # 원본 영상 (git 제외, GCS 버킷에 업로드)
 ├── docs/
-│   ├── screenshot-main.png   # README용 데스크톱 화면 캡처
-│   └── screenshot-mobile.png # README용 모바일(iPhone) 화면 캡처
-├── Dockerfile             # Cloud Run 컨테이너 빌드
-├── .dockerignore
-├── .env.example           # 환경변수 템플릿
-├── requirements.txt       # Python 패키지 의존성
+│   └── screenshot-video-translate.png
+├── Dockerfile
+├── requirements.txt
 └── README.md
 ```
+
+### 비디오 추가 방법
+
+1. `videos/videos.json`에 항목을 추가합니다.
+2. 영상 파일과 `videos.json`을 버킷에 업로드합니다. 앱은 재배포 없이 새로고침만으로 목록을 반영합니다.
+
+```bash
+gcloud storage cp videos/새영상.mp4 gs://<VIDEOS_GCS_BUCKET>/ --content-type=video/mp4 --project=<YOUR_GCP_PROJECT_ID>
+gcloud storage cp videos/videos.json gs://<VIDEOS_GCS_BUCKET>/videos.json --content-type=application/json --project=<YOUR_GCP_PROJECT_ID>
+```
+
+```json
+{
+  "videos": [
+    { "id": "source_video_1", "title": "CNN 뉴스",   "file": "source_video_1.mp4", "duration": 273, "gain": 1.0, "description": "" },
+    { "id": "source_video_2", "title": "Friends",    "file": "source_video_2.mp4", "duration": 204, "gain": 2.5, "description": "" },
+    { "id": "source_video_3", "title": "Basketball", "file": "source_video_3.mp4", "duration": 934, "gain": 2.5, "description": "" }
+  ]
+}
+```
+
+| 필드 | 설명 |
+| :--- | :--- |
+| `id` | 고유 식별자 (마지막 선택 비디오 복원에 사용) |
+| `title` | 목록에 표시되는 제목 |
+| `file` | 버킷(또는 `VIDEOS_GCS_PREFIX`) 기준 객체 이름 |
+| `duration` | 초 단위 길이 (목록 표시용, 선택) |
+| `gain` | 원문 오디오 보정 배율 (기본 1.0, 최대 4.0). 번역 음성은 약 -19 dB 평균 음량으로 생성되므로 원본이 작은 영상(-27 dB 등)은 2.0~3.0 권장 |
+| `description` | 부가 설명 (선택) |
+
+> Cloud Run 서비스 계정에는 버킷에 대한 `roles/storage.objectViewer`가 필요합니다. 버킷에 `allUsers` 공개 읽기 권한이 있으면 영상이 로그인 게이트와 무관하게 공개 URL로 노출되므로 비공개 버킷 사용을 권장합니다.
 
 ---
 
 ## ⚙️ 환경변수 (`.env`)
-
-`.env.example`을 복사하여 `.env`를 만들고 값을 채웁니다. `.env`는 Git 및 Cloud Build 업로드에서 제외됩니다.
 
 ```bash
 cp .env.example .env
@@ -98,79 +119,68 @@ GEMINI_API_KEY=
 
 # 모델 설정
 LIVE_TRANSLATE_MODEL=gemini-3.5-live-translate-preview
-SUMMARY_MODEL=gemini-3.8-flash
 
-# 10분(600초) 이상 무음성 시 자동 세션 종료
+# 무입력 자동 세션 종료 (초)
 INACTIVITY_TIMEOUT_SECONDS=600
 
 # 로그인 게이트 (비워두면 로그인 비활성화)
 APP_LOGIN_PASSWORD=<YOUR_SHARED_PASSWORD>
-# 로그인 쿠키 서명용 비밀키 (openssl rand -hex 32 로 생성, 배포 간 동일하게 유지)
 APP_SESSION_SECRET=<RANDOM_HEX_SECRET>
-# 로그인 유지 시간 (시간 단위)
 APP_SESSION_HOURS=12
+
+# 비디오 저장소: GCS 버킷 이름 (gs:// 제외). 비워두면 로컬 videos/ 폴더 사용
+VIDEOS_GCS_BUCKET=live-translate
+# 버킷 내 객체 접두사 (예: videos). 비워두면 버킷 루트
+VIDEOS_GCS_PREFIX=
 ```
 
 | 변수 | 설명 |
 | :--- | :--- |
 | `APP_LOGIN_PASSWORD` | 로그인 화면에서 입력할 고정 비밀번호 |
-| `APP_SESSION_SECRET` | 로그인 쿠키를 HMAC 서명하는 서버 전용 비밀키. 비워두면 프로세스마다 랜덤 생성되어 **재시작/다중 인스턴스 시 로그인이 풀리므로** 운영 환경에서는 반드시 고정값을 지정 |
+| `APP_SESSION_SECRET` | 로그인 쿠키를 HMAC 서명하는 비밀키. 운영 환경에서는 반드시 고정값 지정 |
 | `APP_SESSION_HOURS` | 로그인 쿠키 유효 시간 |
+| `VIDEOS_GCS_BUCKET` | 비디오 파일과 `videos.json`을 읽을 GCS 버킷 |
+| `VIDEOS_GCS_PREFIX` | 버킷 내 하위 경로 (선택) |
 
 ---
 
 ## 💻 로컬 실행 방법
 
-### 1. 사전 준비
-
-- Python 3.11 이상
-- Google Cloud SDK (`gcloud`) 및 ADC 로그인
-
 ```bash
-# Vertex AI 호출용 ADC 인증
-gcloud auth application-default login
-```
-
-### 2. 가상환경 및 의존성 설치
-
-```bash
+gcloud auth application-default login   # Vertex AI / GCS 호출용 ADC
 python3 -m venv .venv
 ./.venv/bin/pip install -r requirements.txt
+./.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 3. 서버 실행
-
-```bash
-./.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-브라우저에서 **[http://localhost:8000](http://localhost:8000)** 으로 접속하면 로그인 화면이 표시되고, `APP_LOGIN_PASSWORD`를 입력하면 통역 화면으로 이동합니다.
+브라우저에서 **[http://localhost:8000](http://localhost:8000)** 접속 → 로그인 → 비디오 선택.
+`VIDEOS_GCS_BUCKET`을 비우면 `videos/` 폴더의 파일을 직접 서빙합니다.
 
 ---
 
 ## ☁️ Cloud Run 배포 방법
-
-
-### 1. 사전 준비
 
 ```bash
 gcloud auth login
 gcloud config set project <YOUR_GCP_PROJECT_ID>
 ```
 
-다음 API가 활성화되어 있어야 합니다: Cloud Run, Cloud Build, Artifact Registry, Vertex AI.
-Cloud Run 서비스 계정(기본: Compute Engine 기본 서비스 계정)에 **`roles/aiplatform.user`** 역할이 필요합니다.
+필요 API: Cloud Run, Cloud Build, Artifact Registry, Vertex AI, Cloud Storage.
+Cloud Run 서비스 계정에 **`roles/aiplatform.user`** 와 버킷 읽기 권한(**`roles/storage.objectViewer`**)이 필요합니다.
 
-### 2. 배포
-
-`.env`의 값을 셸 환경변수로 로드한 뒤 `--set-env-vars`로 전달하면 비밀값이 명령어에 직접 노출되지 않습니다.
+비밀값이 명령어에 노출되지 않도록 `.env`의 값을 YAML로 옮겨 `--env-vars-file`로 전달합니다.
 
 ```bash
-set -a; source .env; set +a
+# .env → env.yaml (예: KEY: "value" 형식)
+python3 - <<'EOF'
+keys=["AUTH_MODE","GOOGLE_CLOUD_PROJECT","GOOGLE_CLOUD_LOCATION","LIVE_TRANSLATE_MODEL","INACTIVITY_TIMEOUT_SECONDS","APP_LOGIN_PASSWORD","APP_SESSION_SECRET","APP_SESSION_HOURS","VIDEOS_GCS_BUCKET","VIDEOS_GCS_PREFIX"]
+env={l.split("=",1)[0].strip():l.split("=",1)[1].strip() for l in open(".env") if "=" in l and not l.startswith("#")}
+open("env.yaml","w").write("".join(f'{k}: "{env[k]}"\n' for k in keys if env.get(k)))
+EOF
 
-gcloud run deploy live-translate \
+gcloud run deploy live-translate-video \
   --source=. \
-  --project="${GOOGLE_CLOUD_PROJECT}" \
+  --project=<YOUR_GCP_PROJECT_ID> \
   --region=asia-northeast3 \
   --allow-unauthenticated \
   --port=8080 \
@@ -182,19 +192,20 @@ gcloud run deploy live-translate \
   --max-instances=1 \
   --session-affinity \
   --no-cpu-throttling \
-  --set-env-vars="AUTH_MODE=adc,GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT},GOOGLE_CLOUD_LOCATION=global,LIVE_TRANSLATE_MODEL=${LIVE_TRANSLATE_MODEL},SUMMARY_MODEL=${SUMMARY_MODEL},INACTIVITY_TIMEOUT_SECONDS=${INACTIVITY_TIMEOUT_SECONDS},APP_LOGIN_PASSWORD=${APP_LOGIN_PASSWORD},APP_SESSION_SECRET=${APP_SESSION_SECRET},APP_SESSION_HOURS=${APP_SESSION_HOURS}" \
+  --env-vars-file=env.yaml \
   --quiet
+
+rm env.yaml
 ```
 
 | 옵션 | 이유 |
 | :--- | :--- |
-| `--region=asia-northeast3` | 서울 리전 (모델 호출은 `GOOGLE_CLOUD_LOCATION=global`로 별도 라우팅) |
-| `--allow-unauthenticated` | 브라우저에서 직접 접속. 앱 자체 로그인 게이트가 접근을 제어 |
-| `--timeout=3600` | 장시간 WebSocket 통역 세션 유지 (최대 60분/요청) |
+| `--region=asia-northeast3` | 서울 리전 (버킷과 동일 리전 권장, 모델 호출은 `global`) |
+| `--timeout=3600` | 장시간 WebSocket 세션 유지 |
 | `--session-affinity` | 재연결 시 같은 인스턴스로 라우팅하여 인메모리 세션 핸들 재사용 |
 | `--no-cpu-throttling` | 요청 사이에도 CPU 유지 → WebSocket 스트리밍 안정화 |
 
-배포가 끝나면 `Service URL: https://live-translate-<hash>.asia-northeast3.run.app` 형태의 주소가 출력됩니다. HTTPS이므로 모바일 브라우저에서도 바로 마이크 권한이 동작합니다.
+> 영상 파일은 컨테이너에 포함되지 않습니다 (`.gcloudignore`/`.dockerignore`에서 제외). 모든 미디어는 GCS에서 읽습니다.
 
 ---
 
@@ -202,8 +213,20 @@ gcloud run deploy live-translate \
 
 | 경로 | 설명 |
 | :--- | :--- |
-| `GET /` | 통역 화면 (로그인 필요) |
+| `GET /` | 비디오 번역 화면 (로그인 필요) |
 | `GET /login`, `POST /api/login`, `POST /api/logout` | 로그인 게이트 |
-| `GET /api/config` | 모델/언어 설정 |
-| `WS /ws/translate` | 16kHz PCM 업스트림 + 원문/번역문 자막 다운스트림 |
-| `POST /api/summarize` | 대화 기록 기반 회의록(Markdown) 생성 |
+| `GET /api/config` | 모델 / 지원 언어 / 음성 프리셋 / 비디오 소스 |
+| `GET /api/videos` | 비디오 목록 (GCS의 `videos.json`, 로그인 필요) |
+| `GET /media/{file}` | 비디오 스트리밍. Range 요청을 8 MiB 단위 206으로 응답 (로그인 필요) |
+| `WS /ws/translate?target_lang=&voice=&echo_target_language=` | 16kHz PCM 업스트림 → 자막(JSON) + 번역 음성 24kHz PCM(binary) 다운스트림 |
+
+### WebSocket 클라이언트 → 서버 메시지
+
+| 메시지 | 설명 |
+| :--- | :--- |
+| binary frame | 16kHz 16-bit mono PCM 청크 (~100ms) |
+| `{"type":"update_config","target_lang","voice","echo_target_language"}` | 설정 변경 (변경 시 서버가 세션 재연결) |
+| `{"type":"activity"}` | 무입력 타이머 리셋 |
+| `{"type":"stop","reason"}` | 명시적 세션 종료 |
+
+

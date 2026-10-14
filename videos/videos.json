@@ -1,0 +1,28 @@
+{
+  "videos": [
+    {
+      "id": "source_video_1",
+      "title": "CNN 뉴스",
+      "file": "source_video_1.mp4",
+      "duration": 273,
+      "gain": 1.0,
+      "description": ""
+    },
+    {
+      "id": "source_video_2",
+      "title": "Friends",
+      "file": "source_video_2.mp4",
+      "duration": 204,
+      "gain": 2.5,
+      "description": ""
+    },
+    {
+      "id": "source_video_3",
+      "title": "Basketball",
+      "file": "source_video_3.mp4",
+      "duration": 934,
+      "gain": 2.5,
+      "description": ""
+    }
+  ]
+}

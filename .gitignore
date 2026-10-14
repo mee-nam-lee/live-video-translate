@@ -5,3 +5,7 @@ __pycache__/
 .DS_Store
 .vscode
 .gcloudignore
+# Video media lives in GCS (VIDEOS_GCS_BUCKET); only videos.json is tracked
+videos/*.mp4
+videos/*.webm
+videos/*.mov

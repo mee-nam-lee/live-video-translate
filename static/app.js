@@ -1,132 +1,64 @@
 /**
- * Google Gemini 3.5 Live Translate — Frontend Web Application
- * Works across Desktop Web, iPhone (iOS Safari/Chrome), and Android browsers.
+ * Gemini Live Video Translate — Frontend
  *
- * Features:
- * - Single smart microphone capture (16kHz mono PCM) with automatic noise suppression
- *   and voice-band filtering (85Hz high-pass + 7.5kHz low-pass)
- * - Automatic device & speaker-aware echo control (captures PC conference speaker when muted,
- *   prevents self-translation feedback loop when speaker output is enabled)
- * - Collapsible Source panel so Target panel expands to full height with larger text
- * - Smart auto-scroll that pauses when the user scrolls up to read earlier sentences
- * - Mobile browser resilience (iOS Safari interrupted AudioContext recovery, Wake Lock,
- *   seamless WebSocket auto-reconnect with session_id handle persistence)
+ * Pipeline
+ *   <video> ──createMediaElementSource──┬─▶ AudioWorklet ─▶ 16kHz 16-bit PCM ─▶ WebSocket ─▶ Gemini Live
+ *                                       └─▶ sourceGain ──┐
+ *   Gemini 24kHz PCM ◀── WebSocket ──▶ scheduler ─▶ targetGain ─┴─▶ speakers
+ *
+ * - Source (original) and target (translated) audio volumes are fully independent.
+ * - Optional auto-ducking lowers the source while translated speech is playing.
+ * - Translated subtitles are rendered as a max-2-line overlay on top of the player.
  */
 
 (() => {
   "use strict";
 
-  const POPULAR_LANG_CODES = [
-    "en",
-    "ko",
-    "ja",
-    "zh-Hans",
-    "zh-Hant",
-    "es",
-    "fr",
-    "de",
-    "vi",
-    "th",
-    "id",
-    "pt-BR",
-    "ru",
-    "ar",
-    "hi",
-  ];
+  // =========================================================================
+  // Constants & fallbacks
+  // =========================================================================
 
-  // Official supported languages for Gemini 3.5 Live Translate
-  // (https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-5-live-translate#supported-languages)
-  const DEFAULT_SUPPORTED_LANGUAGES = [
+  const STORAGE_KEY = "live_video_translate_settings_v1";
+  const INPUT_SAMPLE_RATE = 16000;
+  const OUTPUT_SAMPLE_RATE = 24000;
+  const DUCK_RATIO = 0.5; // source gain multiplier while translated speech plays (-6 dB)
+  const SPEECH_PEAK_THRESHOLD = 500; // int16 peak (~ -36 dBFS) above which a chunk counts as speech
+  const DUCK_RELEASE_S = 0.35; // keep ducking briefly after the last audible chunk
+  const END_DRAIN_SILENCE_MS = 1800; // silence required after video end before closing the session
+  const END_DRAIN_MAX_MS = 20000;
+  const SUBTITLE_IDLE_HIDE_MS = 6000;
+  const SUBTITLE_FINALIZE_MS = 1600;
+  const SEEK_RECONNECT_DEBOUNCE_MS = 450;
+
+  const DEFAULT_SETTINGS = {
+    targetLang: "ko",
+    sourceVolume: 10,
+    targetVolume: 100,
+    voice: "auto",
+    autoDuck: false,
+    showSource: false,
+    subtitleSize: "md",
+    echoTargetLanguage: true,
+    lastVideoId: null,
+  };
+
+  // Minimal fallback if /api/config is unreachable (server normally supplies 78 languages)
+  const FALLBACK_LANGUAGES = [
     { code: "en", name: "English", ko_name: "영어", popular: true },
     { code: "ko", name: "Korean", ko_name: "한국어", popular: true },
     { code: "ja", name: "Japanese", ko_name: "일본어", popular: true },
     { code: "zh-Hans", name: "Chinese (Simplified)", ko_name: "중국어 (간체)", popular: true },
-    { code: "zh-Hant", name: "Chinese (Traditional)", ko_name: "중국어 (번체)", popular: true },
     { code: "es", name: "Spanish", ko_name: "스페인어", popular: true },
     { code: "fr", name: "French", ko_name: "프랑스어", popular: true },
     { code: "de", name: "German", ko_name: "독일어", popular: true },
-    { code: "vi", name: "Vietnamese", ko_name: "베트남어", popular: true },
-    { code: "th", name: "Thai", ko_name: "태국어", popular: true },
-    { code: "id", name: "Indonesian", ko_name: "인도네시아어", popular: true },
-    { code: "ru", name: "Russian", ko_name: "러시아어", popular: true },
-    { code: "pt-BR", name: "Portuguese (Brazil)", ko_name: "포르투갈어 (브라질)", popular: true },
-    { code: "ar", name: "Arabic", ko_name: "아랍어", popular: true },
-    { code: "hi", name: "Hindi", ko_name: "힌디어", popular: true },
-    { code: "af", name: "Afrikaans", ko_name: "아프리칸스어", popular: false },
-    { code: "ak", name: "Akan", ko_name: "아칸어", popular: false },
-    { code: "sq", name: "Albanian", ko_name: "알바니아어", popular: false },
-    { code: "am", name: "Amharic", ko_name: "암하라어", popular: false },
-    { code: "hy", name: "Armenian", ko_name: "아르메니아어", popular: false },
-    { code: "az", name: "Azerbaijani", ko_name: "아제르바이잔어", popular: false },
-    { code: "eu", name: "Basque", ko_name: "바스크어", popular: false },
-    { code: "be", name: "Belarusian", ko_name: "벨라루스어", popular: false },
-    { code: "bn", name: "Bengali", ko_name: "벵골어", popular: false },
-    { code: "bg", name: "Bulgarian", ko_name: "불가리아어", popular: false },
-    { code: "my", name: "Burmese (Myanmar)", ko_name: "미얀마어 (버마어)", popular: false },
-    { code: "ca", name: "Catalan", ko_name: "카탈로니아어", popular: false },
-    { code: "hr", name: "Croatian", ko_name: "크로아티아어", popular: false },
-    { code: "cs", name: "Czech", ko_name: "체코어", popular: false },
-    { code: "da", name: "Danish", ko_name: "덴마크어", popular: false },
-    { code: "nl", name: "Dutch", ko_name: "네덜란드어", popular: false },
-    { code: "et", name: "Estonian", ko_name: "에스토니아어", popular: false },
-    { code: "fil", name: "Filipino", ko_name: "필리핀어", popular: false },
-    { code: "fi", name: "Finnish", ko_name: "핀란드어", popular: false },
-    { code: "gl", name: "Galician", ko_name: "갈리시아어", popular: false },
-    { code: "ka", name: "Georgian", ko_name: "조지아어", popular: false },
-    { code: "el", name: "Greek", ko_name: "그리스어", popular: false },
-    { code: "gu", name: "Gujarati", ko_name: "구자라트어", popular: false },
-    { code: "ha", name: "Hausa", ko_name: "하우사어", popular: false },
-    { code: "he", name: "Hebrew", ko_name: "히브리어", popular: false },
-    { code: "hu", name: "Hungarian", ko_name: "헝가리어", popular: false },
-    { code: "is", name: "Icelandic", ko_name: "아이슬란드어", popular: false },
-    { code: "it", name: "Italian", ko_name: "이탈리아어", popular: false },
-    { code: "jv", name: "Javanese", ko_name: "자바어", popular: false },
-    { code: "kn", name: "Kannada", ko_name: "칸나다어", popular: false },
-    { code: "kk", name: "Kazakh", ko_name: "카자흐어", popular: false },
-    { code: "km", name: "Khmer", ko_name: "크메르어", popular: false },
-    { code: "rw", name: "Kinyarwanda", ko_name: "키냐르완다어", popular: false },
-    { code: "lo", name: "Lao", ko_name: "라오어", popular: false },
-    { code: "lv", name: "Latvian", ko_name: "라트비아어", popular: false },
-    { code: "lt", name: "Lithuanian", ko_name: "리투아니아어", popular: false },
-    { code: "mk", name: "Macedonian", ko_name: "마케도니아어", popular: false },
-    { code: "ms", name: "Malay", ko_name: "말레이어", popular: false },
-    { code: "ml", name: "Malayalam", ko_name: "말라얄람어", popular: false },
-    { code: "mr", name: "Marathi", ko_name: "마라티어", popular: false },
-    { code: "mn", name: "Mongolian", ko_name: "몽골어", popular: false },
-    { code: "ne", name: "Nepali", ko_name: "네팔어", popular: false },
-    { code: "no", name: "Norwegian", ko_name: "노르웨이어", popular: false },
-    { code: "nb", name: "Norwegian Bokmål", ko_name: "노르웨이어 (보크몰)", popular: false },
-    { code: "fa", name: "Persian", ko_name: "페르시아어", popular: false },
-    { code: "pl", name: "Polish", ko_name: "폴란드어", popular: false },
-    { code: "pt-PT", name: "Portuguese (Portugal)", ko_name: "포르투갈어 (포르투갈)", popular: false },
-    { code: "pa", name: "Punjabi", ko_name: "펀자브어", popular: false },
-    { code: "ro", name: "Romanian", ko_name: "루마니아어", popular: false },
-    { code: "sr", name: "Serbian", ko_name: "세르비아어", popular: false },
-    { code: "sd", name: "Sindhi", ko_name: "신디어", popular: false },
-    { code: "si", name: "Sinhala", ko_name: "싱할라어", popular: false },
-    { code: "sk", name: "Slovak", ko_name: "슬로바키아어", popular: false },
-    { code: "sl", name: "Slovenian", ko_name: "슬로베니아어", popular: false },
-    { code: "su", name: "Sundanese", ko_name: "순다어", popular: false },
-    { code: "sw", name: "Swahili", ko_name: "스와힐리어", popular: false },
-    { code: "sv", name: "Swedish", ko_name: "스웨덴어", popular: false },
-    { code: "ta", name: "Tamil", ko_name: "타밀어", popular: false },
-    { code: "te", name: "Telugu", ko_name: "텔루구어", popular: false },
-    { code: "tr", name: "Turkish", ko_name: "튀르키예어", popular: false },
-    { code: "uk", name: "Ukrainian", ko_name: "우크라이나어", popular: false },
-    { code: "ur", name: "Urdu", ko_name: "우르두어", popular: false },
-    { code: "uz", name: "Uzbek", ko_name: "우즈베크어", popular: false },
-    { code: "zu", name: "Zulu", ko_name: "줄루어", popular: false },
+  ];
+  const FALLBACK_VOICES = [
+    { id: "auto", name: "자동 (화자 음성 복제)", description: "원 화자의 목소리를 따라 번역 음성을 생성합니다." },
   ];
 
-  // Detect mobile browser (iPhone / iPad / Android) vs Desktop PC browser
-  const IS_MOBILE_BROWSER =
-    /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || "") ||
-    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-
-  // Unique client session ID for seamless server-side resumption across mobile network/tab switches
   const CLIENT_SESSION_ID = (() => {
     try {
-      const key = "live_translate_session_id";
+      const key = "live_video_translate_session_id";
       let existing = sessionStorage.getItem(key);
       if (!existing) {
         existing =
@@ -141,1093 +73,669 @@
     }
   })();
 
-  // Application State
+  // =========================================================================
+  // DOM
+  // =========================================================================
+
+  const $ = (id) => document.getElementById(id);
+  const dom = {
+    statusPill: $("sessionStatusPill"),
+    statusText: $("sessionStatusText"),
+    btnToggleSidebar: $("btnToggleSidebar"),
+    btnOpenSettings: $("btnOpenSettings"),
+    btnLogout: $("btnLogout"),
+    workspace: $("workspace"),
+    sidebar: $("videoSidebar"),
+    videoList: $("videoList"),
+    videoCountBadge: $("videoCountBadge"),
+    playerWrap: $("playerWrap"),
+    video: $("videoPlayer"),
+    playerEmpty: $("playerEmpty"),
+    subtitleOverlay: $("subtitleOverlay"),
+    subtitleSource: $("subtitleSource"),
+    subtitleTarget: $("subtitleTarget"),
+    detectedLang: $("detectedLang"),
+    detectedLangText: $("detectedLangText"),
+    targetLangSelect: $("targetLangSelect"),
+    sourceVolume: $("sourceVolume"),
+    sourceVolumeValue: $("sourceVolumeValue"),
+    sourceVolIcon: $("sourceVolIcon"),
+    btnMuteSource: $("btnMuteSource"),
+    targetVolume: $("targetVolume"),
+    targetVolumeValue: $("targetVolumeValue"),
+    targetVolIcon: $("targetVolIcon"),
+    btnMuteTarget: $("btnMuteTarget"),
+    settingsModal: $("settingsModal"),
+    btnCloseSettings: $("btnCloseSettings"),
+    btnDoneSettings: $("btnDoneSettings"),
+    voiceSelect: $("voiceSelect"),
+    voiceDesc: $("voiceDesc"),
+    autoDuckToggle: $("autoDuckToggle"),
+    showSourceToggle: $("showSourceToggle"),
+    echoToggle: $("echoToggle"),
+    segButtons: Array.from(document.querySelectorAll(".seg-btn")),
+    modelTag: $("modelTag"),
+    toast: $("toastMessage"),
+  };
+
+  // =========================================================================
+  // State
+  // =========================================================================
+
   const state = {
-    config: null,
-    languagesMap: new Map(), // code -> { code, name, ko_name }
-    isRecording: false,
-    userWantsRecording: false, // True while user has not pressed Stop (used for auto-reconnect)
-    isSourceCollapsed: false,
+    settings: { ...DEFAULT_SETTINGS },
+    languages: FALLBACK_LANGUAGES,
+    voices: FALLBACK_VOICES,
+    videos: [],
+    currentVideo: null,
+
+    // WebSocket / session
     ws: null,
-    reconnectTimer: null,
+    userWantsSession: false,
     reconnectAttempts: 0,
-    wakeLock: null,
-
-    // Audio Capture Context & Nodes
-    audioCtx: null,
-    micStream: null,
-    captureWorkletNode: null,
-    captureScriptNode: null,
-    captureSourceNode: null,
-
-    // Session Timer & Activity Tracking
-    sessionStartTime: null,
-    sessionTimerInterval: null,
-    lastActivityAt: Date.now(),
+    reconnectTimer: null,
+    sessionConnected: false,
     lastActivityPingAt: 0,
 
-    // Auto-scroll lock per panel (true = stick to bottom automatically)
-    autoScrollSource: true,
-    autoScrollTarget: true,
+    // Web Audio graph
+    audioCtx: null,
+    mediaSourceNode: null,
+    videoGain: null, // per-video loudness compensation (videos.json "gain")
+    captureNode: null,
+    captureSink: null,
+    sourceGain: null,
+    targetGain: null,
+    captureReady: false,
+    isSending: false,
 
-    // Transcript Data & Active Streaming Lines
-    sourceEntries: [], // [{ id, text, timestamp, lang }]
-    targetEntries: [], // [{ id, text, timestamp, lang }]
-    chronologicalEntries: [], // [{ role: 'source'|'target', text, timestamp, lang }]
-    activeSourceCard: null,
-    activeTargetCard: null,
-    lastDetectedSourceLang: null,
+    // Translated-audio scheduler
+    nextPlayTime: 0,
+    scheduledSources: new Set(),
+    pcmRemainder: new Uint8Array(0),
+    duckTimer: null,
+    rxChunks: 0,
+    rxBytes: 0,
+    rxLastPeak: 0,
+    rxLoudChunks: 0,
+    loudUntil: 0, // AudioContext time until which audible translated speech is scheduled
 
-    // Meeting Summary Cache
-    summaryMarkdown: "",
-    summaryEntryCountAtGeneration: -1,
-    isSummarizing: false,
+    // Subtitles
+    targetLines: [], // committed sentences (strings)
+    activeTarget: null, // { text, interim, timer }
+    sourceActive: "",
+    subtitleHideTimer: null,
+
+    // Playback lifecycle
+    seekTimer: null,
+    endDrainTimer: null,
+    prevSourceVolume: 10,
+    lastSpeechWallMs: 0,
+    prevTargetVolume: 100,
   };
 
-  // DOM Elements
-  const dom = {
-    sessionStatusPill: document.getElementById("sessionStatusPill"),
-    sessionStatusText: document.getElementById("sessionStatusText"),
-    sessionTimer: document.getElementById("sessionTimer"),
-
-    btnSummary: document.getElementById("btnSummary"),
-    summaryBtnIcon: document.getElementById("summaryBtnIcon"),
-    summaryBtnLabel: document.getElementById("summaryBtnLabel"),
-    btnOpenDownload: document.getElementById("btnOpenDownload"),
-    btnClear: document.getElementById("btnClear"),
-
-    sourceLangSelect: document.getElementById("sourceLangSelect"),
-    targetLangSelect: document.getElementById("targetLangSelect"),
-    btnSwapLang: document.getElementById("btnSwapLang"),
-    detectedLangChip: document.getElementById("detectedLangChip"),
-
-    btnToggleMic: document.getElementById("btnToggleMic"),
-    micIcon: document.getElementById("micIcon"),
-    micBtnText: document.getElementById("micBtnText"),
-    audioBars: document.getElementById("audioBars"),
-
-    splitStage: document.getElementById("splitStage"),
-    sourcePanel: document.getElementById("sourcePanel"),
-    targetPanel: document.getElementById("targetPanel"),
-
-    sourcePanelLangTag: document.getElementById("sourcePanelLangTag"),
-    targetPanelLangTag: document.getElementById("targetPanelLangTag"),
-    sourceCollapsedPreview: document.getElementById("sourceCollapsedPreview"),
-    sourceCountBadge: document.getElementById("sourceCountBadge"),
-    targetCountBadge: document.getElementById("targetCountBadge"),
-    btnCopySource: document.getElementById("btnCopySource"),
-    btnCopyTarget: document.getElementById("btnCopyTarget"),
-    btnToggleSourceCollapse: document.getElementById("btnToggleSourceCollapse"),
-    sourceCollapseIcon: document.getElementById("sourceCollapseIcon"),
-    sourceCollapseLabel: document.getElementById("sourceCollapseLabel"),
-
-    sourceScrollArea: document.getElementById("sourceScrollArea"),
-    targetScrollArea: document.getElementById("targetScrollArea"),
-    sourceEmptyState: document.getElementById("sourceEmptyState"),
-    targetEmptyState: document.getElementById("targetEmptyState"),
-    sourceUtteranceList: document.getElementById("sourceUtteranceList"),
-    targetUtteranceList: document.getElementById("targetUtteranceList"),
-    btnJumpSourceLatest: document.getElementById("btnJumpSourceLatest"),
-    btnJumpTargetLatest: document.getElementById("btnJumpTargetLatest"),
-
-    toastMessage: document.getElementById("toastMessage"),
-  };
-
-  let toastTimeoutId = null;
-
   // =========================================================================
-  // 1. Initialization & Config Loading
+  // Utilities
   // =========================================================================
 
-  async function initApp() {
-    bindEventListeners();
-
-    // Immediately populate language dropdowns from built-in official list
-    DEFAULT_SUPPORTED_LANGUAGES.forEach((lang) => {
-      state.languagesMap.set(lang.code, lang);
-    });
-    populateLanguageSelectors(DEFAULT_SUPPORTED_LANGUAGES, "en", "ko");
-    updateLanguageTagsUI();
-
-    try {
-      const res = await fetch("/api/config");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const cfg = await res.json();
-      state.config = cfg;
-
-      if (Array.isArray(cfg.supported_languages) && cfg.supported_languages.length > 0) {
-        const currentSrc = dom.sourceLangSelect.value || cfg.default_source_language || "en";
-        const currentTgt = dom.targetLangSelect.value || cfg.default_target_language || "ko";
-        cfg.supported_languages.forEach((lang) => {
-          state.languagesMap.set(lang.code, lang);
-        });
-        populateLanguageSelectors(
-          cfg.supported_languages,
-          currentSrc,
-          currentTgt
-        );
-      }
-    } catch (err) {
-      console.warn("Using built-in supported languages list:", err);
-    }
-
-    updateLanguageTagsUI();
+  let toastTimer = null;
+  function showToast(message, durationMs = 3200) {
+    if (!dom.toast) return;
+    dom.toast.textContent = message;
+    dom.toast.hidden = false;
+    dom.toast.classList.add("is-visible");
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      dom.toast.classList.remove("is-visible");
+      setTimeout(() => (dom.toast.hidden = true), 250);
+    }, durationMs);
   }
 
-  function populateLanguageSelectors(languages, defaultSource, defaultTarget) {
-    const popularList = [];
-    const allList = [...languages].sort((a, b) =>
-      a.ko_name.localeCompare(b.ko_name, "ko")
+  function setStatus(stateName, text) {
+    dom.statusPill.setAttribute("data-state", stateName);
+    dom.statusText.textContent = text;
+  }
+
+  function formatDuration(sec) {
+    if (!Number.isFinite(sec) || sec <= 0) return "";
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return `${m}:${String(s).padStart(2, "0")}`;
+  }
+
+  function findLanguage(code) {
+    if (!code) return null;
+    const lower = code.toLowerCase();
+    return (
+      state.languages.find((l) => l.code.toLowerCase() === lower) ||
+      state.languages.find((l) => l.code.toLowerCase() === lower.split("-")[0]) ||
+      null
     );
-
-    POPULAR_LANG_CODES.forEach((code) => {
-      const found = state.languagesMap.get(code);
-      if (found) popularList.push(found);
-    });
-
-    const orderedLanguages = [
-      ...popularList,
-      ...allList.filter((lang) => !POPULAR_LANG_CODES.includes(lang.code)),
-    ];
-
-    // Populate Source Select (Auto Detect + all supported languages without optgroup headers)
-    dom.sourceLangSelect.innerHTML = "";
-    const autoOpt = document.createElement("option");
-    autoOpt.value = "auto";
-    autoOpt.textContent = "🌐 자동 감지 (Auto Detect)";
-    if (defaultSource === "auto") autoOpt.selected = true;
-    dom.sourceLangSelect.appendChild(autoOpt);
-
-    orderedLanguages.forEach((lang) => {
-      const opt = document.createElement("option");
-      opt.value = lang.code;
-      opt.textContent = `${lang.ko_name} (${lang.name} · ${lang.code})`;
-      if (lang.code === defaultSource) opt.selected = true;
-      dom.sourceLangSelect.appendChild(opt);
-    });
-
-    // Populate Target Select (all supported languages without optgroup headers)
-    dom.targetLangSelect.innerHTML = "";
-    orderedLanguages.forEach((lang) => {
-      const opt = document.createElement("option");
-      opt.value = lang.code;
-      opt.textContent = `${lang.ko_name} (${lang.name} · ${lang.code})`;
-      if (lang.code === defaultTarget) opt.selected = true;
-      dom.targetLangSelect.appendChild(opt);
-    });
   }
 
   function formatLanguageLabel(code) {
-    if (!code) return "-";
-    if (code === "auto") return "자동 감지 (Auto)";
-    const normalized = code.split("-")[0].toLowerCase();
-    const entry =
-      state.languagesMap.get(code) || state.languagesMap.get(normalized);
-    if (entry) {
-      return `${entry.ko_name} (${entry.code})`;
-    }
-    return code;
+    const lang = findLanguage(code);
+    if (!lang) return code || "-";
+    return `${lang.ko_name} (${lang.code})`;
   }
 
-  function updateLanguageTagsUI() {
-    const srcCode = dom.sourceLangSelect.value;
-    const tgtCode = dom.targetLangSelect.value;
-    dom.sourcePanelLangTag.textContent = formatLanguageLabel(srcCode);
-    dom.targetPanelLangTag.textContent = formatLanguageLabel(tgtCode);
-
-    if (srcCode !== "auto" && !state.lastDetectedSourceLang) {
-      dom.detectedLangChip.hidden = true;
-    }
-  }
-
-  // =========================================================================
-  // 2. Dialog Fallbacks, Source Collapse & UI Event Listeners
-  // =========================================================================
-
-  function setupDialogFallbacks() {
-    // Safari fallback for <dialog closedby="any">
-    if (!("closedBy" in HTMLDialogElement.prototype)) {
-      document.querySelectorAll('dialog[closedby="any"]').forEach((dialog) => {
-        dialog.addEventListener("click", (e) => {
-          if (e.target === dialog) dialog.close();
-        });
-      });
-    }
-  }
-
-  function setupShareButtonVisibility() {
-    if (dom.btnShareReport && typeof navigator.share === "function") {
-      dom.btnShareReport.hidden = false;
-    }
-  }
-
-  function toggleSourcePanelCollapse() {
-    state.isSourceCollapsed = !state.isSourceCollapsed;
-    const collapsed = state.isSourceCollapsed;
-
-    dom.splitStage.classList.toggle("is-source-collapsed", collapsed);
-    dom.sourcePanel.classList.toggle("is-collapsed", collapsed);
-    dom.btnToggleSourceCollapse.setAttribute(
-      "aria-expanded",
-      collapsed ? "false" : "true"
-    );
-    dom.sourceCollapseIcon.textContent = collapsed
-      ? "unfold_more"
-      : "unfold_less";
-    dom.sourceCollapseLabel.textContent = collapsed ? "펼치기" : "접기";
-
-    updateCollapsedSourcePreview();
-
-    // Keep Target scrolled to latest after expanding/collapsing
-    if (state.autoScrollTarget) {
-      scrollToLatest(dom.targetScrollArea, true);
-    }
-    if (!collapsed && state.autoScrollSource) {
-      scrollToLatest(dom.sourceScrollArea, true);
-    }
-  }
-
-  function updateCollapsedSourcePreview(latestTextOverride) {
-    if (!dom.sourceCollapsedPreview) return;
-    if (!state.isSourceCollapsed) {
-      dom.sourceCollapsedPreview.hidden = true;
-      return;
-    }
-    const activeText = state.activeSourceCard
-      ? (
-          state.activeSourceCard.entry.text +
-          (state.activeSourceCard.entry.interimText || "")
-        ).trim()
-      : "";
-    const lastCommitted =
-      state.sourceEntries.length > 0
-        ? state.sourceEntries[state.sourceEntries.length - 1].text
-        : "";
-    const preview = latestTextOverride || activeText || lastCommitted;
-    if (preview) {
-      dom.sourceCollapsedPreview.textContent = `· ${preview}`;
-      dom.sourceCollapsedPreview.hidden = false;
-    } else {
-      dom.sourceCollapsedPreview.hidden = true;
-    }
-  }
-
-  function bindEventListeners() {
-    // Primary Mic Start / Stop
-    dom.btnToggleMic.addEventListener("click", () => {
-      if (state.isRecording || state.userWantsRecording) {
-        stopTranslationSession(true, "user_ended_meeting");
-      } else {
-        startTranslationSession();
-      }
-    });
-
-    // Collapse / Expand Source Panel
-    if (dom.btnToggleSourceCollapse) {
-      dom.btnToggleSourceCollapse.addEventListener(
-        "click",
-        toggleSourcePanelCollapse
-      );
-    }
-
-    // Smart Auto-Scroll Tracking (pause auto-scroll when user scrolls up to read history)
-    setupSmartScrollListener(
-      dom.sourceScrollArea,
-      "autoScrollSource",
-      dom.btnJumpSourceLatest
-    );
-    setupSmartScrollListener(
-      dom.targetScrollArea,
-      "autoScrollTarget",
-      dom.btnJumpTargetLatest
-    );
-
-    // Language Select Changes
-    dom.sourceLangSelect.addEventListener("change", () => {
-      updateLanguageTagsUI();
-      notifyConfigChangeIfActive();
-    });
-
-    dom.targetLangSelect.addEventListener("change", () => {
-      updateLanguageTagsUI();
-      finalizeActiveCard("target");
-      notifyConfigChangeIfActive();
-      showToast(
-        `Target 언어가 ${formatLanguageLabel(dom.targetLangSelect.value)}(으)로 설정되었습니다.`
-      );
-    });
-
-    // Swap Source <-> Target Language
-    dom.btnSwapLang.addEventListener("click", () => {
-      const currentSource = dom.sourceLangSelect.value;
-      const currentTarget = dom.targetLangSelect.value;
-
-      let nextTarget = currentSource;
-      if (nextTarget === "auto") {
-        const detectedBase = state.lastDetectedSourceLang
-          ? state.lastDetectedSourceLang.split("-")[0].toLowerCase()
-          : "en";
-        nextTarget = state.languagesMap.has(detectedBase) ? detectedBase : "en";
-      }
-
-      const nextSource = currentTarget;
-      dom.sourceLangSelect.value = nextSource;
-      dom.targetLangSelect.value = nextTarget;
-
-      updateLanguageTagsUI();
-      finalizeActiveCard("source");
-      finalizeActiveCard("target");
-      notifyConfigChangeIfActive();
-      showToast(
-        `언어 전환: ${formatLanguageLabel(nextSource)} → ${formatLanguageLabel(nextTarget)}`
-      );
-    });
-
-    // Copy Source / Target Buttons
-    dom.btnCopySource.addEventListener("click", () => {
-      const text = getPanelFullText("source");
-      if (!text) {
-        showToast("복사할 Source 텍스트가 없습니다.");
-        return;
-      }
-      copyToClipboard(text, "Source 원문 전체가 클립보드에 복사되었습니다.");
-    });
-
-    dom.btnCopyTarget.addEventListener("click", () => {
-      const text = getPanelFullText("target");
-      if (!text) {
-        showToast("복사할 Target 번역 텍스트가 없습니다.");
-        return;
-      }
-      copyToClipboard(text, "Target 번역문 전체가 클립보드에 복사되었습니다.");
-    });
-
-    // Clear Transcript Button
-    dom.btnClear.addEventListener("click", () => {
-      if (
-        state.sourceEntries.length === 0 &&
-        state.targetEntries.length === 0 &&
-        !state.activeSourceCard &&
-        !state.activeTargetCard
-      ) {
-        showToast("초기화할 대화 기록이 없습니다.");
-        return;
-      }
-      clearTranscriptHistory();
-      showToast("대화 기록이 초기화되었습니다.");
-    });
-
-    // Direct Meeting Summary (.md) Generation & Save
-    dom.btnSummary.addEventListener("click", () => {
-      generateAndDownloadSummaryMd();
-    });
-
-    // Direct Source / Target Transcript (.md) Save
-    dom.btnOpenDownload.addEventListener("click", () => {
-      downloadTranscriptMd();
-    });
-
-    // Logout: end any active translation session, clear auth cookie, go to login page
-    const btnLogout = document.getElementById("btnLogout");
-    if (btnLogout) {
-      btnLogout.addEventListener("click", async () => {
-        if (!window.confirm("로그아웃하시겠습니까? 진행 중인 통역 세션은 종료됩니다.")) return;
-        try {
-          if (state.userWantsRecording || state.isRecording) {
-            stopTranslationSession(true, "user_logout");
-          }
-        } catch (_) {}
-        try {
-          await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
-        } catch (_) {}
-        window.location.replace("/login");
-      });
-    }
-
-    // Mobile & Tab visibility recovery (iOS Safari AudioContext interruption + Wake Lock + WS reconnect)
-    document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible" && state.userWantsRecording) {
-        resumeAudioContextIfNeeded();
-        requestScreenWakeLock();
-        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-          scheduleWebSocketReconnect(100);
-        }
-      }
-    });
-
-    // Bluetooth headset / AirPods / Galaxy Buds plug & unplug auto-recovery
-    if (navigator.mediaDevices?.addEventListener) {
-      navigator.mediaDevices.addEventListener("devicechange", async () => {
-        if (state.userWantsRecording) {
-          try {
-            await startMicrophoneCapture();
-          } catch (_) {}
-        }
-      });
-    }
-
-    // Explicitly terminate Live API session when closing tab/window
-    const handlePageUnload = () => {
-      if (state.isRecording || state.ws) {
-        stopTranslationSession(true, "page_unload");
-      }
-    };
-    window.addEventListener("pagehide", handlePageUnload);
-    window.addEventListener("beforeunload", handlePageUnload);
-  }
-
-  function setupSmartScrollListener(scrollEl, stateFlagKey, jumpBtn) {
-    if (!scrollEl) return;
-    scrollEl.addEventListener(
-      "scroll",
-      () => {
-        const distFromBottom =
-          scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
-        const isAtBottom = distFromBottom < 48;
-        state[stateFlagKey] = isAtBottom;
-        if (jumpBtn) {
-          jumpBtn.hidden = isAtBottom;
-        }
-      },
-      { passive: true }
-    );
-
-    if (jumpBtn) {
-      jumpBtn.addEventListener("click", () => {
-        state[stateFlagKey] = true;
-        jumpBtn.hidden = true;
-        scrollToLatest(scrollEl, true);
-      });
-    }
-  }
-
-  function notifyConfigChangeIfActive() {
-    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-      state.ws.send(
-        JSON.stringify({
-          type: "update_config",
-          source_lang: dom.sourceLangSelect.value,
-          target_lang: dom.targetLangSelect.value,
-          echo_target_language: true,
-        })
-      );
-    }
-  }
-
-  // =========================================================================
-  // 3. WebSocket & Live Translation Session Lifecycle (with Mobile Auto-Reconnect)
-  // =========================================================================
-
-  async function startTranslationSession() {
-    if (state.isRecording) return;
-
-    // If accessed via http://0.0.0.0:8000, redirect to http://localhost:8000 so Secure Context is enabled
-    if (window.location.hostname === "0.0.0.0") {
-      const targetUrl = `${window.location.protocol}//localhost:${window.location.port || 8000}${window.location.pathname}${window.location.search}`;
-      window.location.replace(targetUrl);
-      return;
-    }
-
-    // Check Secure Context requirement for microphone on mobile/remote browsers
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setSessionStatus("error", "localhost 또는 HTTPS 필요");
-      showToast(
-        `현재 주소(${window.location.origin})는 브라우저 보안 정책상 마이크가 차단됩니다. http://localhost:${window.location.port || 8000} 또는 HTTPS 주소로 접속해 주세요.`
-      );
-      return;
-    }
-
-    state.userWantsRecording = true;
-    state.reconnectAttempts = 0;
-    setSessionStatus("connecting", "마이크 및 세션 연결 중...");
-    dom.btnToggleMic.disabled = true;
-
+  function loadSettings() {
     try {
-      await startMicrophoneCapture();
-      await requestScreenWakeLock();
-      openTranslationWebSocket(false);
-    } catch (err) {
-      console.error("Failed to start translation session:", err);
-      state.userWantsRecording = false;
-      dom.btnToggleMic.disabled = false;
-      stopMicrophoneCapture();
-      setSessionStatus("error", "마이크 권한 실패");
-      showToast(
-        `마이크를 시작할 수 없습니다: ${err.message || "브라우저 마이크 권한을 허용해 주세요."}`
-      );
-    }
-  }
-
-  function openTranslationWebSocket(isReconnect = false) {
-    if (!state.userWantsRecording) return;
-
-    if (state.ws) {
-      try {
-        state.ws.close();
-      } catch (_) {}
-      state.ws = null;
-    }
-
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const params = new URLSearchParams({
-      session_id: CLIENT_SESSION_ID,
-      source_lang: dom.sourceLangSelect.value,
-      target_lang: dom.targetLangSelect.value,
-      echo_target_language: "true",
-    });
-    const wsUrl = `${protocol}//${window.location.host}/ws/translate?${params.toString()}`;
-
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = "arraybuffer";
-    state.ws = ws;
-
-    ws.addEventListener("open", () => {
-      state.isRecording = true;
-      state.reconnectAttempts = 0;
-      state.lastActivityAt = Date.now();
-      dom.btnToggleMic.disabled = false;
-      dom.btnToggleMic.setAttribute("data-recording", "true");
-      dom.micIcon.textContent = "stop_circle";
-      dom.micBtnText.textContent = "통역 종료";
-      dom.audioBars.hidden = false;
-      if (!state.sessionTimerInterval) {
-        startSessionTimer();
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        state.settings = { ...DEFAULT_SETTINGS, ...parsed };
       }
-      resumeAudioContextIfNeeded();
-    });
-
-    ws.addEventListener("message", (event) => {
-      handleServerWebSocketMessage(event.data);
-    });
-
-    ws.addEventListener("close", (event) => {
-      // 4401: server rejected the connection because the login session is missing/expired
-      if (event && event.code === 4401) {
-        stopTranslationSession(false, "auth_expired");
-        showToast("로그인 세션이 만료되었습니다. 다시 로그인해 주세요.");
-        setTimeout(() => window.location.replace("/login"), 800);
-        return;
-      }
-      if (!state.userWantsRecording) return;
-      state.isRecording = false;
-      scheduleWebSocketReconnect();
-    });
-
-    ws.addEventListener("error", () => {
-      if (!isReconnect) {
-        console.warn("WebSocket connection error; will retry if session active.");
-      }
-    });
-  }
-
-  function scheduleWebSocketReconnect(customDelayMs) {
-    if (!state.userWantsRecording) return;
-    if (state.reconnectTimer) {
-      clearTimeout(state.reconnectTimer);
-      state.reconnectTimer = null;
-    }
-
-    state.reconnectAttempts += 1;
-    if (state.reconnectAttempts > 8) {
-      stopTranslationSession(false, "reconnect_exhausted");
-      showToast("네트워크 연결이 끊어져 통역 세션이 종료되었습니다.");
-      return;
-    }
-
-    const delay =
-      typeof customDelayMs === "number"
-        ? customDelayMs
-        : Math.min(4000, 600 * Math.pow(1.5, state.reconnectAttempts - 1));
-
-    setSessionStatus(
-      "reconnecting",
-      `연결 복구 중 (${state.reconnectAttempts})...`
-    );
-
-    state.reconnectTimer = setTimeout(async () => {
-      state.reconnectTimer = null;
-      if (!state.userWantsRecording) return;
-      // Ensure mic track is still live (iOS may end track after backgrounding)
-      const trackLive = state.micStream
-        ?.getAudioTracks()
-        .some((t) => t.readyState === "live");
-      if (!trackLive) {
-        try {
-          await startMicrophoneCapture();
-        } catch (_) {}
-      }
-      openTranslationWebSocket(true);
-    }, delay);
-  }
-
-  function stopTranslationSession(
-    sendStopSignal = true,
-    reason = "user_ended_meeting"
-  ) {
-    state.userWantsRecording = false;
-    state.isRecording = false;
-
-    if (state.reconnectTimer) {
-      clearTimeout(state.reconnectTimer);
-      state.reconnectTimer = null;
-    }
-
-    dom.btnToggleMic.disabled = false;
-    dom.btnToggleMic.setAttribute("data-recording", "false");
-    dom.micIcon.textContent = "mic";
-    dom.micBtnText.textContent = "통역 시작";
-    dom.audioBars.hidden = true;
-    resetVisualizerBars();
-
-    stopSessionTimer();
-    releaseScreenWakeLock();
-    stopMicrophoneCapture();
-
-    finalizeActiveCard("source");
-    finalizeActiveCard("target");
-
-    if (state.ws) {
-      try {
-        if (sendStopSignal && state.ws.readyState === WebSocket.OPEN) {
-          state.ws.send(JSON.stringify({ type: "stop", reason }));
-        }
-        state.ws.close();
-      } catch (_) {}
-      state.ws = null;
-    }
-
-    setSessionStatus("idle", "대기 중");
-  }
-
-  function handleServerWebSocketMessage(rawText) {
-    let msg;
-    try {
-      msg = JSON.parse(rawText);
     } catch (_) {
+      state.settings = { ...DEFAULT_SETTINGS };
+    }
+  }
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state.settings));
+    } catch (_) {}
+  }
+
+  function updateSetting(key, value) {
+    state.settings[key] = value;
+    saveSettings();
+  }
+
+  // =========================================================================
+  // Bootstrap
+  // =========================================================================
+
+  async function init() {
+    loadSettings();
+    await Promise.all([fetchConfig(), fetchVideos()]);
+    renderLanguageSelect();
+    renderVoiceSelect();
+    renderVideoList();
+    applySettingsToUI();
+    bindEvents();
+    setStatus("idle", "대기 중");
+
+    // Restore last-selected video (without autoplay)
+    const last = state.videos.find((v) => v.id === state.settings.lastVideoId);
+    if (last) selectVideo(last, { autoplay: false });
+  }
+
+  async function fetchConfig() {
+    try {
+      const res = await fetch("/api/config", { credentials: "same-origin" });
+      if (res.status === 401) {
+        window.location.replace("/login");
+        return;
+      }
+      const cfg = await res.json();
+      if (Array.isArray(cfg.supported_languages) && cfg.supported_languages.length) {
+        state.languages = cfg.supported_languages;
+      }
+      if (Array.isArray(cfg.supported_voices) && cfg.supported_voices.length) {
+        state.voices = cfg.supported_voices;
+      }
+      if (cfg.live_translate_model && dom.modelTag) {
+        dom.modelTag.textContent = cfg.live_translate_model;
+      }
+    } catch (err) {
+      console.warn("Failed to load /api/config, using fallbacks:", err);
+    }
+  }
+
+  async function fetchVideos() {
+    try {
+      const res = await fetch(`/api/videos?ts=${Date.now()}`, {
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      if (res.status === 401) {
+        window.location.replace("/login");
+        return;
+      }
+      const data = await res.json();
+      state.videos = Array.isArray(data.videos) ? data.videos.filter((v) => v && v.file) : [];
+    } catch (err) {
+      console.error("Failed to load videos.json:", err);
+      state.videos = [];
+      showToast("비디오 목록을 불러오지 못했습니다.");
+    }
+  }
+
+  // =========================================================================
+  // Rendering
+  // =========================================================================
+
+  function renderLanguageSelect() {
+    const sel = dom.targetLangSelect;
+    sel.innerHTML = "";
+    const popular = state.languages.filter((l) => l.popular);
+    const others = state.languages
+      .filter((l) => !l.popular)
+      .sort((a, b) => a.ko_name.localeCompare(b.ko_name, "ko"));
+
+    const makeGroup = (label, list) => {
+      const group = document.createElement("optgroup");
+      group.label = label;
+      list.forEach((l) => {
+        const opt = document.createElement("option");
+        opt.value = l.code;
+        opt.textContent = `${l.ko_name} (${l.name} · ${l.code})`;
+        group.appendChild(opt);
+      });
+      return group;
+    };
+    if (popular.length) sel.appendChild(makeGroup("주요 언어", popular));
+    if (others.length) sel.appendChild(makeGroup("전체 언어", others));
+    sel.value = state.settings.targetLang;
+    if (!sel.value) sel.value = "ko";
+  }
+
+  function renderVoiceSelect() {
+    const sel = dom.voiceSelect;
+    sel.innerHTML = "";
+    state.voices.forEach((v) => {
+      const opt = document.createElement("option");
+      opt.value = v.id;
+      opt.textContent = v.name;
+      sel.appendChild(opt);
+    });
+    sel.value = state.settings.voice;
+    if (!sel.value) sel.value = "auto";
+    updateVoiceDescription();
+  }
+
+  function updateVoiceDescription() {
+    const v = state.voices.find((x) => x.id === dom.voiceSelect.value);
+    dom.voiceDesc.textContent = v?.description || "";
+  }
+
+  function renderVideoList() {
+    dom.videoList.innerHTML = "";
+    dom.videoCountBadge.textContent = String(state.videos.length);
+
+    if (!state.videos.length) {
+      const li = document.createElement("li");
+      li.className = "video-item-empty";
+      li.textContent = "등록된 비디오가 없습니다.";
+      dom.videoList.appendChild(li);
       return;
     }
 
-    switch (msg.type) {
-      case "status": {
-        if (msg.status === "connected") {
-          setSessionStatus("connected", "실시간 통역 중");
-        } else if (
-          msg.status === "connecting" ||
-          msg.status === "resuming" ||
-          msg.status === "reconnecting"
-        ) {
-          setSessionStatus("connecting", "세션 연결 중...");
+    state.videos.forEach((video, index) => {
+      const li = document.createElement("li");
+      li.className = "video-item";
+      li.setAttribute("role", "option");
+      li.setAttribute("aria-selected", "false");
+      li.dataset.videoId = video.id;
+      li.tabIndex = 0;
+
+      li.innerHTML = `
+        <div class="video-thumb" aria-hidden="true">
+          <span class="thumb-index">${index + 1}</span>
+          <span class="material-symbols-outlined thumb-icon">play_arrow</span>
+        </div>
+        <div class="video-meta">
+          <span class="video-title"></span>
+          <span class="video-sub"></span>
+        </div>
+      `;
+      li.querySelector(".video-title").textContent = video.title || video.file;
+      const subParts = [];
+      if (video.duration) subParts.push(formatDuration(video.duration));
+      if (video.description) subParts.push(video.description);
+      li.querySelector(".video-sub").textContent = subParts.join(" · ");
+
+      const activate = () => selectVideo(video, { autoplay: true });
+      li.addEventListener("click", activate);
+      li.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          activate();
         }
-        break;
-      }
-
-      case "go_away": {
-        showToast("장시간 세션 자동 연장 중입니다.");
-        break;
-      }
-
-      case "inactive_timeout": {
-        stopTranslationSession(false, "inactive_timeout");
-        showToast(
-          msg.message ||
-            "10분 이상 음성 입력이 없어 세션이 자동 종료되었습니다."
-        );
-        break;
-      }
-
-      case "session_closed": {
-        if (state.isRecording || state.userWantsRecording) {
-          stopTranslationSession(false, msg.reason || "explicit_stop");
-        }
-        break;
-      }
-
-      case "config_updated": {
-        updateLanguageTagsUI();
-        break;
-      }
-
-      case "input_transcription": {
-        state.lastActivityAt = Date.now();
-        if (msg.language_code) {
-          updateDetectedLanguageBadge(msg.language_code);
-        }
-        if (msg.text) {
-          appendStreamingTranscription(
-            "source",
-            msg.text,
-            Boolean(msg.finished),
-            msg.language_code || dom.sourceLangSelect.value,
-            Boolean(msg.interim)
-          );
-        }
-        break;
-      }
-
-      case "output_transcription": {
-        state.lastActivityAt = Date.now();
-        if (msg.text) {
-          appendStreamingTranscription(
-            "target",
-            msg.text,
-            Boolean(msg.finished),
-            msg.language_code || dom.targetLangSelect.value,
-            false
-          );
-        }
-        break;
-      }
-
-      case "turn_complete": {
-        if (msg.turn_complete) {
-          finalizeActiveCard("source");
-          finalizeActiveCard("target");
-        }
-        break;
-      }
-
-      case "error": {
-        setSessionStatus("error", "연결 오류");
-        showToast(msg.message || "오류가 발생했습니다.");
-        break;
-      }
-
-      default:
-        break;
-    }
-  }
-
-  function updateDetectedLanguageBadge(langCode) {
-    state.lastDetectedSourceLang = langCode;
-    dom.detectedLangChip.hidden = false;
-    dom.detectedLangChip.textContent = `감지: ${formatLanguageLabel(langCode)}`;
-  }
-
-  // =========================================================================
-  // 4. Streaming Sentence Lines & Smart Auto-Scroll
-  // =========================================================================
-
-  function appendStreamingTranscription(
-    role,
-    chunkText,
-    isFinished,
-    langCode,
-    isInterim
-  ) {
-    const isSource = role === "source";
-    const activeKey = isSource ? "activeSourceCard" : "activeTargetCard";
-    const listEl = isSource ? dom.sourceUtteranceList : dom.targetUtteranceList;
-    const emptyEl = isSource ? dom.sourceEmptyState : dom.targetEmptyState;
-    const scrollEl = isSource ? dom.sourceScrollArea : dom.targetScrollArea;
-    const shouldAutoScroll = isSource
-      ? state.autoScrollSource
-      : state.autoScrollTarget;
-
-    if (!emptyEl.hidden) {
-      emptyEl.hidden = true;
-    }
-
-    let lineObj = state[activeKey];
-    const nowStr = formatTimeHHMMSS(new Date());
-
-    if (!lineObj) {
-      const entry = {
-        id: `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        role,
-        text: "",
-        interimText: "",
-        timestamp: nowStr,
-        lang: langCode,
-      };
-
-      const lineEl = document.createElement("p");
-      lineEl.className = "utterance-line is-streaming";
-      listEl.appendChild(lineEl);
-
-      lineObj = {
-        entry,
-        el: lineEl,
-        textEl: lineEl,
-        lastUpdatedAt: Date.now(),
-        timerId: null,
-      };
-      state[activeKey] = lineObj;
-    }
-
-    if (langCode && langCode !== "auto") {
-      lineObj.entry.lang = langCode;
-    }
-
-    if (isInterim) {
-      lineObj.entry.interimText = chunkText;
-    } else {
-      lineObj.entry.interimText = "";
-      lineObj.entry.text = mergeTranscriptChunk(lineObj.entry.text, chunkText);
-    }
-
-    const displayText = (
-      lineObj.entry.text + (lineObj.entry.interimText || "")
-    ).trim();
-    lineObj.textEl.textContent = displayText;
-    lineObj.lastUpdatedAt = Date.now();
-
-    if (isSource && state.isSourceCollapsed) {
-      updateCollapsedSourcePreview(displayText);
-    }
-
-    if (shouldAutoScroll) {
-      scrollToLatest(scrollEl, false);
-    }
-
-    if (lineObj.timerId) {
-      clearTimeout(lineObj.timerId);
-      lineObj.timerId = null;
-    }
-
-    const endsWithSentencePunct = /[.?!。？！]\s*$/.test(displayText);
-    if (isFinished || endsWithSentencePunct) {
-      finalizeActiveCard(role);
-    } else {
-      lineObj.timerId = setTimeout(() => {
-        finalizeActiveCard(role);
-      }, 1600);
-    }
-  }
-
-  function mergeTranscriptChunk(existing, incoming) {
-    if (!existing) return incoming;
-    if (!incoming) return existing;
-    return existing + incoming;
-  }
-
-  function finalizeActiveCard(role) {
-    const isSource = role === "source";
-    const activeKey = isSource ? "activeSourceCard" : "activeTargetCard";
-    const lineObj = state[activeKey];
-    if (!lineObj) return;
-
-    if (lineObj.timerId) {
-      clearTimeout(lineObj.timerId);
-      lineObj.timerId = null;
-    }
-
-    lineObj.el.classList.remove("is-streaming");
-    const finalText = (
-      lineObj.entry.text ||
-      lineObj.entry.interimText ||
-      ""
-    ).trim();
-    lineObj.entry.text = finalText;
-    lineObj.textEl.textContent = finalText;
-
-    state[activeKey] = null;
-
-    if (!finalText) {
-      lineObj.el.remove();
-      return;
-    }
-
-    if (isSource) {
-      state.sourceEntries.push(lineObj.entry);
-      dom.sourceCountBadge.textContent = `${state.sourceEntries.length}문장`;
-      updateCollapsedSourcePreview(finalText);
-      if (state.autoScrollSource) scrollToLatest(dom.sourceScrollArea, false);
-    } else {
-      state.targetEntries.push(lineObj.entry);
-      dom.targetCountBadge.textContent = `${state.targetEntries.length}문장`;
-      if (state.autoScrollTarget) scrollToLatest(dom.targetScrollArea, false);
-    }
-
-    state.chronologicalEntries.push({
-      role: lineObj.entry.role,
-      text: lineObj.entry.text,
-      timestamp: lineObj.entry.timestamp,
-      lang: lineObj.entry.lang,
+      });
+      dom.videoList.appendChild(li);
     });
   }
 
-  function scrollToLatest(containerEl, force) {
-    if (!containerEl) return;
-    requestAnimationFrame(() => {
-      containerEl.scrollTop = containerEl.scrollHeight;
-      if (force) {
-        if (containerEl === dom.sourceScrollArea && dom.btnJumpSourceLatest) {
-          dom.btnJumpSourceLatest.hidden = true;
-        }
-        if (containerEl === dom.targetScrollArea && dom.btnJumpTargetLatest) {
-          dom.btnJumpTargetLatest.hidden = true;
-        }
-      }
+  function highlightSelectedVideo() {
+    dom.videoList.querySelectorAll(".video-item").forEach((li) => {
+      const selected = state.currentVideo && li.dataset.videoId === state.currentVideo.id;
+      li.classList.toggle("is-selected", Boolean(selected));
+      li.setAttribute("aria-selected", selected ? "true" : "false");
     });
   }
 
-  function clearTranscriptHistory() {
-    finalizeActiveCard("source");
-    finalizeActiveCard("target");
-
-    state.sourceEntries = [];
-    state.targetEntries = [];
-    state.chronologicalEntries = [];
-    state.summaryMarkdown = "";
-    state.summaryEntryCountAtGeneration = -1;
-    state.autoScrollSource = true;
-    state.autoScrollTarget = true;
-
-    dom.sourceUtteranceList.innerHTML = "";
-    dom.targetUtteranceList.innerHTML = "";
-    dom.sourceEmptyState.hidden = false;
-    dom.targetEmptyState.hidden = false;
-    dom.sourceCountBadge.textContent = "0문장";
-    dom.targetCountBadge.textContent = "0문장";
-    if (dom.btnJumpSourceLatest) dom.btnJumpSourceLatest.hidden = true;
-    if (dom.btnJumpTargetLatest) dom.btnJumpTargetLatest.hidden = true;
-    updateCollapsedSourcePreview("");
+  function applySettingsToUI() {
+    const s = state.settings;
+    dom.sourceVolume.value = s.sourceVolume;
+    dom.targetVolume.value = s.targetVolume;
+    dom.autoDuckToggle.checked = Boolean(s.autoDuck);
+    dom.showSourceToggle.checked = Boolean(s.showSource);
+    dom.echoToggle.checked = Boolean(s.echoTargetLanguage);
+    dom.subtitleOverlay.dataset.size = s.subtitleSize || "md";
+    dom.segButtons.forEach((b) => b.classList.toggle("is-active", b.dataset.size === s.subtitleSize));
+    dom.subtitleSource.hidden = !s.showSource;
+    updateVolumeUI();
+    applyGains();
   }
 
-  function getPanelFullText(role) {
-    const isSource = role === "source";
-    const entries = isSource ? state.sourceEntries : state.targetEntries;
-    const active = isSource ? state.activeSourceCard : state.activeTargetCard;
-
-    const lines = entries.map((item) => item.text);
-    if (active && active.entry.text.trim()) {
-      lines.push(active.entry.text.trim());
-    }
-    return lines.join("\n");
-  }
-
-  function getAllCommittedAndActiveEntries() {
-    const list = [...state.chronologicalEntries];
-    if (state.activeSourceCard && state.activeSourceCard.entry.text.trim()) {
-      list.push({
-        role: "source",
-        text: state.activeSourceCard.entry.text.trim(),
-        timestamp: state.activeSourceCard.entry.timestamp,
-        lang: state.activeSourceCard.entry.lang,
-      });
-    }
-    if (state.activeTargetCard && state.activeTargetCard.entry.text.trim()) {
-      list.push({
-        role: "target",
-        text: state.activeTargetCard.entry.text.trim(),
-        timestamp: state.activeTargetCard.entry.timestamp,
-        lang: state.activeTargetCard.entry.lang,
-      });
-    }
-    return list;
+  function updateVolumeUI() {
+    const sv = Number(dom.sourceVolume.value);
+    const tv = Number(dom.targetVolume.value);
+    dom.sourceVolumeValue.textContent = `${sv}%`;
+    dom.targetVolumeValue.textContent = `${tv}%`;
+    dom.sourceVolIcon.textContent = sv === 0 ? "volume_off" : sv < 50 ? "volume_down" : "volume_up";
+    dom.targetVolIcon.textContent = tv === 0 ? "voice_over_off" : "record_voice_over";
+    dom.btnMuteSource.classList.toggle("is-muted", sv === 0);
+    dom.btnMuteTarget.classList.toggle("is-muted", tv === 0);
+    dom.sourceVolume.style.setProperty("--pct", `${sv}%`);
+    dom.targetVolume.style.setProperty("--pct", `${tv}%`);
   }
 
   // =========================================================================
-  // 5. Smart Microphone Audio Engine (16kHz PCM + Voice Filter + Noise Gate)
+  // Events
   // =========================================================================
 
-  /**
-   * Determine whether browser echoCancellation should be enabled:
-   * - On iPhone / Android: true (mobile hardware AEC/NS works best while still picking up external speakers/voices).
-   * - On Desktop PC: false so the mic also picks up video conference audio coming out of the same PC's speakers.
-   */
-  function shouldEnableEchoCancellation() {
-    return IS_MOBILE_BROWSER;
-  }
-
-  function ensureAudioContext() {
-    if (!state.audioCtx || state.audioCtx.state === "closed") {
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      // Open at native hardware sampleRate (important for iOS Safari & macOS)
-      state.audioCtx = new AudioCtx();
-
-      state.audioCtx.addEventListener("statechange", () => {
-        if (
-          state.userWantsRecording &&
-          state.audioCtx &&
-          (state.audioCtx.state === "suspended" ||
-            state.audioCtx.state === "interrupted")
-        ) {
-          state.audioCtx.resume().catch(() => {});
-        }
-      });
-    }
-    resumeAudioContextIfNeeded();
-    return state.audioCtx;
-  }
-
-  function resumeAudioContextIfNeeded() {
-    if (
-      state.audioCtx &&
-      (state.audioCtx.state === "suspended" ||
-        state.audioCtx.state === "interrupted")
-    ) {
-      state.audioCtx.resume().catch(() => {});
-    }
-  }
-
-  async function startMicrophoneCapture() {
-    stopMicrophoneCapture(false);
-
-    const audioCtx = ensureAudioContext();
-    if (audioCtx.state === "suspended" || audioCtx.state === "interrupted") {
-      await audioCtx.resume();
-    }
-
-    const wantAEC = shouldEnableEchoCancellation();
-    const micStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: wantAEC,
-        // Always keep noiseSuppression & autoGainControl ON so background fan/keyboard/room noise
-        // is suppressed while human speech (including PC speaker speech) stays crisp.
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-      video: false,
+  function bindEvents() {
+    // Header
+    dom.btnToggleSidebar.addEventListener("click", () => {
+      const collapsed = dom.workspace.classList.toggle("sidebar-collapsed");
+      dom.btnToggleSidebar.setAttribute("aria-expanded", collapsed ? "false" : "true");
     });
-    state.micStream = micStream;
-
-    const actualSampleRate = audioCtx.sampleRate;
-    const micSource = audioCtx.createMediaStreamSource(micStream);
-
-    // Voice-band Biquad filters to strip low-frequency rumble (<85Hz) and high-frequency hiss (>7500Hz)
-    const highpassFilter = audioCtx.createBiquadFilter();
-    highpassFilter.type = "highpass";
-    highpassFilter.frequency.value = 85;
-    highpassFilter.Q.value = 0.707;
-
-    const lowpassFilter = audioCtx.createBiquadFilter();
-    lowpassFilter.type = "lowpass";
-    lowpassFilter.frequency.value = 7500;
-    lowpassFilter.Q.value = 0.707;
-
-    micSource.connect(highpassFilter);
-    highpassFilter.connect(lowpassFilter);
-    state.captureSourceNode = lowpassFilter;
-
-    // Muted sink node so Web Audio engine pulls audio continuously without speaker feedback
-    const muteSink = audioCtx.createGain();
-    muteSink.gain.value = 0;
-    muteSink.connect(audioCtx.destination);
-
-    // 100ms chunk size at native hardware sampleRate
-    const targetChunkSamples = Math.max(
-      1024,
-      Math.round(actualSampleRate * 0.1)
-    );
-
-    if (audioCtx.audioWorklet) {
+    dom.btnLogout.addEventListener("click", async () => {
+      stopSession(true, "logout");
       try {
-        const workletCode = `
-          class Pcm16CaptureProcessor extends AudioWorkletProcessor {
+        await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
+      } catch (_) {}
+      window.location.replace("/login");
+    });
+
+    // Settings modal
+    dom.btnOpenSettings.addEventListener("click", openSettings);
+    dom.btnCloseSettings.addEventListener("click", closeSettings);
+    dom.btnDoneSettings.addEventListener("click", closeSettings);
+    dom.settingsModal.addEventListener("click", (e) => {
+      if (e.target === dom.settingsModal) closeSettings();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !dom.settingsModal.hidden) closeSettings();
+    });
+
+    dom.voiceSelect.addEventListener("change", () => {
+      updateSetting("voice", dom.voiceSelect.value);
+      updateVoiceDescription();
+      pushConfigUpdate("음성 변경");
+    });
+    dom.autoDuckToggle.addEventListener("change", () => {
+      updateSetting("autoDuck", dom.autoDuckToggle.checked);
+      applyGains();
+    });
+    dom.showSourceToggle.addEventListener("change", () => {
+      updateSetting("showSource", dom.showSourceToggle.checked);
+      dom.subtitleSource.hidden = !dom.showSourceToggle.checked;
+      renderSubtitles();
+    });
+    dom.echoToggle.addEventListener("change", () => {
+      updateSetting("echoTargetLanguage", dom.echoToggle.checked);
+      pushConfigUpdate("echo 설정 변경");
+    });
+    dom.segButtons.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        dom.segButtons.forEach((b) => b.classList.toggle("is-active", b === btn));
+        updateSetting("subtitleSize", btn.dataset.size);
+        dom.subtitleOverlay.dataset.size = btn.dataset.size;
+        renderSubtitles();
+      });
+    });
+
+    // Target language
+    dom.targetLangSelect.addEventListener("change", () => {
+      updateSetting("targetLang", dom.targetLangSelect.value);
+      pushConfigUpdate("타겟 언어 변경");
+    });
+
+    // Volumes
+    dom.sourceVolume.addEventListener("input", () => {
+      updateSetting("sourceVolume", Number(dom.sourceVolume.value));
+      updateVolumeUI();
+      applyGains();
+    });
+    dom.targetVolume.addEventListener("input", () => {
+      updateSetting("targetVolume", Number(dom.targetVolume.value));
+      updateVolumeUI();
+      applyGains();
+    });
+    dom.btnMuteSource.addEventListener("click", (e) => {
+      e.preventDefault();
+      toggleMute("source");
+    });
+    dom.btnMuteTarget.addEventListener("click", (e) => {
+      e.preventDefault();
+      toggleMute("target");
+    });
+
+    // Video lifecycle
+    const v = dom.video;
+    v.addEventListener("play", onVideoPlay);
+    v.addEventListener("playing", onVideoPlay);
+    v.addEventListener("pause", onVideoPause);
+    v.addEventListener("seeking", onVideoSeeking);
+    v.addEventListener("seeked", onVideoSeeked);
+    v.addEventListener("ended", onVideoEnded);
+    v.addEventListener("error", () => {
+      showToast("비디오를 재생할 수 없습니다. 파일 경로를 확인해 주세요.");
+      setStatus("error", "재생 오류");
+    });
+
+    window.addEventListener("beforeunload", () => stopSession(true, "unload"));
+  }
+
+  function openSettings() {
+    dom.settingsModal.hidden = false;
+    requestAnimationFrame(() => dom.settingsModal.classList.add("is-open"));
+  }
+  function closeSettings() {
+    dom.settingsModal.classList.remove("is-open");
+    setTimeout(() => (dom.settingsModal.hidden = true), 180);
+  }
+
+  function toggleMute(which) {
+    const input = which === "source" ? dom.sourceVolume : dom.targetVolume;
+    const key = which === "source" ? "sourceVolume" : "targetVolume";
+    const prevKey = which === "source" ? "prevSourceVolume" : "prevTargetVolume";
+    const current = Number(input.value);
+    if (current > 0) {
+      state[prevKey] = current;
+      input.value = 0;
+    } else {
+      const restore = state[prevKey] > 0 ? state[prevKey] : which === "source" ? 10 : 100;
+      input.value = restore;
+    }
+    updateSetting(key, Number(input.value));
+    updateVolumeUI();
+    applyGains();
+  }
+
+  // =========================================================================
+  // Video selection & playback lifecycle
+  // =========================================================================
+
+  function selectVideo(video, { autoplay }) {
+    if (!video) return;
+    const isSame = state.currentVideo && state.currentVideo.id === video.id;
+    state.currentVideo = video;
+    updateSetting("lastVideoId", video.id);
+    highlightSelectedVideo();
+    dom.playerEmpty.hidden = true;
+
+    if (!isSame) {
+      dom.video.src = `/media/${encodeURIComponent(video.file)}`;
+      dom.video.load();
+    }
+
+    resetTranslationState("비디오 선택");
+    ensureAudioGraph();
+    if (state.videoGain) {
+      state.videoGain.gain.setTargetAtTime(getVideoGain(video), state.audioCtx.currentTime, 0.02);
+    }
+
+    // Connect the Live session immediately; audio is only streamed while playing
+    startSession();
+
+    if (autoplay) {
+      dom.video.play().catch(() => {
+        /* autoplay may be blocked until user gesture; controls remain available */
+      });
+    }
+    // Close sidebar on small screens for a cleaner player view
+    if (window.matchMedia("(max-width: 900px)").matches) {
+      dom.workspace.classList.add("sidebar-collapsed");
+      dom.btnToggleSidebar.setAttribute("aria-expanded", "false");
+    }
+  }
+
+  function onVideoPlay() {
+    if (!state.currentVideo) return;
+    if (state.endDrainTimer) {
+      clearTimeout(state.endDrainTimer);
+      state.endDrainTimer = null;
+    }
+    ensureAudioGraph();
+    resumeAudioContext();
+    if (!state.userWantsSession || !state.ws || state.ws.readyState > WebSocket.OPEN) {
+      startSession();
+    }
+    state.isSending = true;
+  }
+
+  function onVideoPause() {
+    // Stop streaming source audio but keep the Live session alive
+    if (dom.video.ended) return;
+    state.isSending = false;
+    if (state.sessionConnected) setStatus("connected", "일시정지");
+  }
+
+  function onVideoSeeking() {
+    state.isSending = false;
+    flushTargetAudio();
+  }
+
+  function onVideoSeeked() {
+    // Debounce: scrubbing emits many seeked events
+    if (state.seekTimer) clearTimeout(state.seekTimer);
+    state.seekTimer = setTimeout(() => {
+      state.seekTimer = null;
+      resetTranslationState("탐색");
+      restartSession("탐색으로 세션 재연결");
+      if (!dom.video.paused && !dom.video.ended) state.isSending = true;
+    }, SEEK_RECONNECT_DEBOUNCE_MS);
+  }
+
+  function onVideoEnded() {
+    state.isSending = false;
+    setStatus("connected", "번역 마무리 중...");
+    // The model keeps streaming (silent) audio while connected, so wait for a stretch of
+    // silence (no audible chunk) rather than an empty queue, with an upper bound.
+    const startedAt = Date.now();
+    state.lastSpeechWallMs = state.lastSpeechWallMs || 0;
+    const check = () => {
+      const now = Date.now();
+      const ctx = state.audioCtx;
+      const speechPending = ctx ? ctx.currentTime < state.loudUntil : false;
+      const silentFor = now - Math.max(state.lastSpeechWallMs, startedAt);
+      const timedOut = now - startedAt > END_DRAIN_MAX_MS;
+      if (!timedOut && (speechPending || state.activeTarget || silentFor < END_DRAIN_SILENCE_MS)) {
+        state.endDrainTimer = setTimeout(check, 300);
+        return;
+      }
+      state.endDrainTimer = null;
+      finalizeTargetSubtitle();
+      stopSession(true, "video_ended");
+      setStatus("done", "번역 완료");
+    };
+    check();
+  }
+
+  function resetTranslationState(_reason) {
+    flushTargetAudio();
+    clearSubtitles();
+  }
+
+  // =========================================================================
+  // Web Audio graph
+  // =========================================================================
+
+  function ensureAudioGraph() {
+    if (state.audioCtx) return state.audioCtx;
+
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AudioCtx({ latencyHint: "interactive" });
+    state.audioCtx = ctx;
+
+    // Element source (can only be created once per media element)
+    state.mediaSourceNode = ctx.createMediaElementSource(dom.video);
+
+    state.videoGain = ctx.createGain();
+    state.videoGain.gain.value = getVideoGain(state.currentVideo);
+    state.sourceGain = ctx.createGain();
+    state.targetGain = ctx.createGain();
+    state.sourceGain.connect(ctx.destination);
+    state.targetGain.connect(ctx.destination);
+    state.mediaSourceNode.connect(state.videoGain);
+    state.videoGain.connect(state.sourceGain);
+
+    applyGains();
+    setupCapture(ctx).catch((err) => {
+      console.error("Capture setup failed:", err);
+      showToast("오디오 캡처 초기화에 실패했습니다.");
+    });
+
+    // Ducking supervisor
+    if (!state.duckTimer) {
+      state.duckTimer = setInterval(applyDucking, 100);
+    }
+    return ctx;
+  }
+
+  function getVideoGain(video) {
+    const g = Number(video && video.gain);
+    return Number.isFinite(g) && g > 0 ? Math.min(g, 4) : 1;
+  }
+
+  function resumeAudioContext() {
+    const ctx = state.audioCtx;
+    if (ctx && (ctx.state === "suspended" || ctx.state === "interrupted")) {
+      ctx.resume().catch(() => {});
+    }
+  }
+
+  async function setupCapture(ctx) {
+    const chunkSamples = Math.max(1024, Math.round(ctx.sampleRate * 0.1)); // ~100ms
+
+    // Muted sink so the graph keeps pulling even if the user mutes the source
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    sink.connect(ctx.destination);
+    state.captureSink = sink;
+
+    if (ctx.audioWorklet) {
+      try {
+        const code = `
+          class PcmCaptureProcessor extends AudioWorkletProcessor {
             constructor() {
               super();
-              this.chunkSize = ${targetChunkSamples};
+              this.chunkSize = ${chunkSamples};
               this.buffer = new Float32Array(this.chunkSize);
               this.writeIndex = 0;
             }
             process(inputs) {
               const input = inputs[0];
               if (!input || !input[0]) return true;
-              const channelData = input[0];
-              for (let i = 0; i < channelData.length; i++) {
-                this.buffer[this.writeIndex++] = channelData[i];
+              const ch0 = input[0];
+              const ch1 = input[1];
+              for (let i = 0; i < ch0.length; i++) {
+                // Downmix to mono
+                this.buffer[this.writeIndex++] = ch1 ? (ch0[i] + ch1[i]) * 0.5 : ch0[i];
                 if (this.writeIndex >= this.chunkSize) {
                   this.port.postMessage(this.buffer.slice(0));
                   this.writeIndex = 0;
@@ -1236,76 +744,52 @@
               return true;
             }
           }
-          registerProcessor("pcm16-capture-processor", Pcm16CaptureProcessor);
+          registerProcessor("pcm-capture-processor", PcmCaptureProcessor);
         `;
-        const blob = new Blob([workletCode], {
-          type: "application/javascript",
+        const blob = new Blob([code], { type: "application/javascript" });
+        const url = URL.createObjectURL(blob);
+        await ctx.audioWorklet.addModule(url);
+        URL.revokeObjectURL(url);
+
+        const node = new AudioWorkletNode(ctx, "pcm-capture-processor", {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
         });
-        const workletUrl = URL.createObjectURL(blob);
-        await audioCtx.audioWorklet.addModule(workletUrl);
-        URL.revokeObjectURL(workletUrl);
-
-        const workletNode = new AudioWorkletNode(
-          audioCtx,
-          "pcm16-capture-processor",
-          {
-            numberOfInputs: 1,
-            numberOfOutputs: 1,
-            outputChannelCount: [1],
-          }
-        );
-        workletNode.port.onmessage = (e) => {
-          processCapturedFloatSamples(e.data, actualSampleRate);
-        };
-
-        lowpassFilter.connect(workletNode);
-        workletNode.connect(muteSink);
-        state.captureWorkletNode = workletNode;
+        node.port.onmessage = (e) => handleCapturedSamples(e.data, ctx.sampleRate);
+        state.videoGain.connect(node);
+        node.connect(sink);
+        state.captureNode = node;
+        state.captureReady = true;
         return;
-      } catch (workletErr) {
-        console.warn(
-          "AudioWorklet fallback to ScriptProcessorNode:",
-          workletErr
-        );
+      } catch (err) {
+        console.warn("AudioWorklet unavailable, falling back to ScriptProcessor:", err);
       }
     }
 
-    // Fallback: ScriptProcessorNode
-    const scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
-    scriptNode.onaudioprocess = (event) => {
-      if (!state.isRecording) return;
-      const inputData = event.inputBuffer.getChannelData(0);
-      processCapturedFloatSamples(
-        new Float32Array(inputData),
-        actualSampleRate
-      );
+    const script = ctx.createScriptProcessor(4096, 2, 1);
+    script.onaudioprocess = (event) => {
+      const ch0 = event.inputBuffer.getChannelData(0);
+      const ch1 = event.inputBuffer.numberOfChannels > 1 ? event.inputBuffer.getChannelData(1) : null;
+      const mono = new Float32Array(ch0.length);
+      for (let i = 0; i < ch0.length; i++) mono[i] = ch1 ? (ch0[i] + ch1[i]) * 0.5 : ch0[i];
+      handleCapturedSamples(mono, ctx.sampleRate);
     };
-    lowpassFilter.connect(scriptNode);
-    scriptNode.connect(muteSink);
-    state.captureScriptNode = scriptNode;
+    state.videoGain.connect(script);
+    script.connect(sink);
+    state.captureNode = script;
+    state.captureReady = true;
   }
 
-  function processCapturedFloatSamples(float32Array, inputSampleRate) {
-    if (
-      !state.isRecording ||
-      !state.ws ||
-      state.ws.readyState !== WebSocket.OPEN
-    ) {
-      return;
-    }
+  function handleCapturedSamples(float32, inputRate) {
+    if (!state.isSending || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
 
-    // Compute RMS energy
-    let sumSquares = 0;
-    for (let i = 0; i < float32Array.length; i++) {
-      sumSquares += float32Array[i] * float32Array[i];
-    }
-    const rms = Math.sqrt(sumSquares / float32Array.length);
-    updateVisualizerBars(rms);
-
-    // Reset 10m inactivity timer when real voice energy is present
+    // RMS for activity keep-alive
+    let sum = 0;
+    for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
+    const rms = Math.sqrt(sum / float32.length);
     if (rms > 0.008) {
       const now = Date.now();
-      state.lastActivityAt = now;
       if (now - state.lastActivityPingAt > 10000) {
         state.lastActivityPingAt = now;
         try {
@@ -1314,326 +798,488 @@
       }
     }
 
-    // Soft noise gate: attenuate ultra-low background hiss (< 0.0025 RMS) so silent rooms stay clean
-    const gateGain = rms < 0.0025 ? 0.15 : 1.0;
-
-    // Resample from native hardware rate (e.g. 48000Hz) to 16000Hz required by Gemini Live API
-    const samples16k =
-      inputSampleRate === 16000
-        ? float32Array
-        : downsampleFloat32(float32Array, inputSampleRate, 16000);
-
-    // Convert Float32 [-1.0, 1.0] to 16-bit signed little-endian PCM
-    const pcm16Buffer = new ArrayBuffer(samples16k.length * 2);
-    const dataView = new DataView(pcm16Buffer);
-    for (let i = 0; i < samples16k.length; i++) {
-      const gated = samples16k[i] * gateGain;
-      const clamped = Math.max(-1, Math.min(1, gated));
-      const int16 = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
-      dataView.setInt16(i * 2, int16, true);
+    const samples = inputRate === INPUT_SAMPLE_RATE ? float32 : downsample(float32, inputRate, INPUT_SAMPLE_RATE);
+    const buf = new ArrayBuffer(samples.length * 2);
+    const view = new DataView(buf);
+    for (let i = 0; i < samples.length; i++) {
+      const c = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(i * 2, c < 0 ? c * 0x8000 : c * 0x7fff, true);
     }
-
-    state.ws.send(pcm16Buffer);
+    try {
+      state.ws.send(buf);
+    } catch (_) {}
   }
 
-  function downsampleFloat32(buffer, sourceRate, targetRate) {
-    if (sourceRate === targetRate) return buffer;
+  function downsample(buffer, sourceRate, targetRate) {
     const ratio = sourceRate / targetRate;
     const newLength = Math.round(buffer.length / ratio);
     const result = new Float32Array(newLength);
     let offsetResult = 0;
     let offsetBuffer = 0;
-    while (offsetResult < result.length) {
-      const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    while (offsetResult < newLength) {
+      const nextOffset = Math.round((offsetResult + 1) * ratio);
       let accum = 0;
       let count = 0;
-      for (
-        let i = offsetBuffer;
-        i < nextOffsetBuffer && i < buffer.length;
-        i++
-      ) {
+      for (let i = offsetBuffer; i < nextOffset && i < buffer.length; i++) {
         accum += buffer[i];
         count++;
       }
       result[offsetResult] = count > 0 ? accum / count : 0;
       offsetResult++;
-      offsetBuffer = nextOffsetBuffer;
+      offsetBuffer = nextOffset;
     }
     return result;
   }
 
-  function stopMicrophoneCapture(closeContext = true) {
-    if (state.captureWorkletNode) {
-      try {
-        state.captureWorkletNode.disconnect();
-      } catch (_) {}
-      state.captureWorkletNode = null;
-    }
-    if (state.captureScriptNode) {
-      try {
-        state.captureScriptNode.disconnect();
-      } catch (_) {}
-      state.captureScriptNode = null;
-    }
-    if (state.captureSourceNode) {
-      try {
-        state.captureSourceNode.disconnect();
-      } catch (_) {}
-      state.captureSourceNode = null;
-    }
-    if (state.micStream) {
-      state.micStream.getTracks().forEach((track) => track.stop());
-      state.micStream = null;
-    }
-    if (closeContext && state.audioCtx) {
-      try {
-        state.audioCtx.close();
-      } catch (_) {}
-      state.audioCtx = null;
-    }
+  // --- Gains & ducking ----------------------------------------------------
+
+  function applyGains() {
+    if (!state.audioCtx) return;
+    const ctx = state.audioCtx;
+    const t = ctx.currentTime;
+    const target = state.settings.targetVolume / 100;
+    state.targetGain.gain.setTargetAtTime(target, t, 0.03);
+    applyDucking(true);
   }
 
-  function updateVisualizerBars(rms) {
-    if (!dom.audioBars || dom.audioBars.hidden) return;
-    const bars = dom.audioBars.querySelectorAll(".bar");
-    const boost = Math.min(1, rms * 9);
-    const multipliers = [0.65, 1.0, 0.85, 0.55];
-    bars.forEach((bar, idx) => {
-      const heightPx = Math.max(4, Math.round(4 + boost * 13 * multipliers[idx]));
-      bar.style.height = `${heightPx}px`;
+  // The model streams audio continuously (including digital silence) while connected,
+  // so "queued audio" is not a speech indicator. Track the time until which audible chunks play.
+  function isTargetSpeechPlaying() {
+    const ctx = state.audioCtx;
+    if (!ctx) return false;
+    return ctx.currentTime < state.loudUntil && state.settings.targetVolume > 0;
+  }
+
+  function applyDucking(immediate = false) {
+    if (!state.audioCtx || !state.sourceGain) return;
+    const base = state.settings.sourceVolume / 100;
+    const duck = state.settings.autoDuck && isTargetSpeechPlaying();
+    const value = duck ? base * DUCK_RATIO : base;
+    const g = state.sourceGain.gain;
+    const t = state.audioCtx.currentTime;
+    if (Math.abs(g.value - value) < 0.001) return;
+    g.setTargetAtTime(value, t, immediate ? 0.03 : duck ? 0.08 : 0.25);
+  }
+
+  // --- Translated audio playback ------------------------------------------
+
+  function enqueueTargetAudio(arrayBuffer) {
+    const ctx = ensureAudioGraph();
+    resumeAudioContext();
+
+    // Merge with remainder to keep 16-bit alignment
+    let bytes = new Uint8Array(arrayBuffer);
+    if (state.pcmRemainder.length) {
+      const merged = new Uint8Array(state.pcmRemainder.length + bytes.length);
+      merged.set(state.pcmRemainder, 0);
+      merged.set(bytes, state.pcmRemainder.length);
+      bytes = merged;
+    }
+    const usable = bytes.length - (bytes.length % 2);
+    state.pcmRemainder = bytes.slice(usable);
+    if (usable === 0) return;
+
+    const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, usable / 2);
+    const audioBuffer = ctx.createBuffer(1, int16.length, OUTPUT_SAMPLE_RATE);
+    const ch = audioBuffer.getChannelData(0);
+    let peak = 0;
+    for (let i = 0; i < int16.length; i++) {
+      const s = int16[i];
+      ch[i] = s / 32768;
+      const a = s < 0 ? -s : s;
+      if (a > peak) peak = a;
+    }
+    state.rxChunks += 1;
+    state.rxBytes += usable;
+    state.rxLastPeak = peak;
+    const isSpeech = peak > SPEECH_PEAK_THRESHOLD;
+    if (isSpeech) state.rxLoudChunks += 1;
+
+    const src = ctx.createBufferSource();
+    src.buffer = audioBuffer;
+    src.connect(state.targetGain);
+
+    const now = ctx.currentTime;
+    const startAt = Math.max(now + 0.04, state.nextPlayTime);
+    src.start(startAt);
+    state.nextPlayTime = startAt + audioBuffer.duration;
+    if (isSpeech) {
+      state.loudUntil = Math.max(state.loudUntil, state.nextPlayTime + DUCK_RELEASE_S);
+      state.lastSpeechWallMs = Date.now();
+    }
+
+    state.scheduledSources.add(src);
+    src.onended = () => state.scheduledSources.delete(src);
+    applyDucking();
+  }
+
+  function flushTargetAudio() {
+    state.scheduledSources.forEach((s) => {
+      try {
+        s.stop();
+      } catch (_) {}
     });
+    state.scheduledSources.clear();
+    state.pcmRemainder = new Uint8Array(0);
+    state.nextPlayTime = 0;
+    state.loudUntil = 0;
+    applyDucking(true);
   }
 
-  function resetVisualizerBars() {
-    if (!dom.audioBars) return;
-    dom.audioBars.querySelectorAll(".bar").forEach((bar) => {
-      bar.style.height = "4px";
+  // =========================================================================
+  // WebSocket session
+  // =========================================================================
+
+  function buildWsUrl() {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const params = new URLSearchParams({
+      session_id: CLIENT_SESSION_ID,
+      target_lang: state.settings.targetLang,
+      echo_target_language: state.settings.echoTargetLanguage ? "true" : "false",
+      voice: state.settings.voice || "auto",
     });
+    return `${protocol}//${window.location.host}/ws/translate?${params.toString()}`;
   }
 
-  // =========================================================================
-  // 6. Screen Wake Lock (Prevents iPhone / Android screen from sleeping mid-session)
-  // =========================================================================
-
-  async function requestScreenWakeLock() {
-    if (!("wakeLock" in navigator)) return;
-    try {
-      if (state.wakeLock) return;
-      state.wakeLock = await navigator.wakeLock.request("screen");
-      state.wakeLock.addEventListener("release", () => {
-        state.wakeLock = null;
-      });
-    } catch (_) {}
+  function startSession() {
+    if (!state.currentVideo) return;
+    if (state.ws && state.ws.readyState <= WebSocket.OPEN && state.userWantsSession) return;
+    state.userWantsSession = true;
+    state.reconnectAttempts = 0;
+    openWebSocket();
   }
 
-  function releaseScreenWakeLock() {
-    if (state.wakeLock) {
+  function restartSession(reason) {
+    if (!state.currentVideo) return;
+    state.userWantsSession = true;
+    state.reconnectAttempts = 0;
+    if (state.ws) {
       try {
-        state.wakeLock.release();
+        if (state.ws.readyState === WebSocket.OPEN) {
+          state.ws.send(JSON.stringify({ type: "stop", reason: reason || "restart" }));
+        }
+        state.ws.onclose = null;
+        state.ws.close();
       } catch (_) {}
-      state.wakeLock = null;
+      state.ws = null;
     }
+    openWebSocket();
   }
 
-  // =========================================================================
-  // 8. Direct One-Click Markdown (.md) Exports (Meeting Summary & Source/Target Transcript)
-  // =========================================================================
-
-  function getTimestampFilenameSuffix() {
-    const d = new Date();
-    const pad = (n) => String(n).padStart(2, "0");
-    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(
-      d.getHours()
-    )}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-  }
-
-  /**
-   * "회의 요약" 버튼 클릭 시:
-   * 대화 내용을 기반으로 AI 회의록(Meeting Minutes)을 생성하여 즉시 .md 파일로 저장합니다.
-   */
-  async function generateAndDownloadSummaryMd() {
-    const entries = getAllCommittedAndActiveEntries();
-    if (entries.length === 0) {
-      showToast("요약할 대화 기록이 아직 없습니다. 먼저 통역을 진행해 주세요.");
-      return;
+  function openWebSocket() {
+    if (!state.userWantsSession) return;
+    if (state.ws) {
+      try {
+        state.ws.onclose = null;
+        state.ws.close();
+      } catch (_) {}
+      state.ws = null;
     }
 
-    if (state.isSummarizing) return;
-    state.isSummarizing = true;
-    dom.btnSummary.disabled = true;
-    if (dom.summaryBtnIcon) dom.summaryBtnIcon.textContent = "hourglass_top";
-    if (dom.summaryBtnLabel) dom.summaryBtnLabel.textContent = "회의록 생성 중...";
-    showToast("Gemini가 회의록을 생성하고 있습니다...");
+    setStatus("connecting", "세션 연결 중...");
+    const ws = new WebSocket(buildWsUrl());
+    ws.binaryType = "arraybuffer";
+    state.ws = ws;
 
-    try {
-      const res = await fetch("/api/summarize", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          entries,
-          source_lang: dom.sourceLangSelect.value,
-          target_lang: dom.targetLangSelect.value,
-        }),
-      });
+    ws.onopen = () => {
+      state.reconnectAttempts = 0;
+      if (!dom.video.paused && !dom.video.ended) state.isSending = true;
+    };
 
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.detail || `HTTP ${res.status}`);
+    ws.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        enqueueTargetAudio(event.data);
+        return;
       }
+      handleServerMessage(event.data);
+    };
 
-      const data = await res.json();
-      state.summaryMarkdown = (data.summary || "").trim();
-      state.summaryEntryCountAtGeneration = entries.length;
+    ws.onclose = (event) => {
+      state.sessionConnected = false;
+      if (event && event.code === 4401) {
+        stopSession(false, "auth_expired");
+        showToast("로그인 세션이 만료되었습니다. 다시 로그인해 주세요.");
+        setTimeout(() => window.location.replace("/login"), 800);
+        return;
+      }
+      if (!state.userWantsSession) return;
+      scheduleReconnect();
+    };
 
-      const nowDisplay = new Date().toLocaleString("ko-KR");
-      const srcLabel = formatLanguageLabel(dom.sourceLangSelect.value);
-      const tgtLabel = formatLanguageLabel(dom.targetLangSelect.value);
+    ws.onerror = () => {
+      /* onclose follows */
+    };
+  }
 
-      const mdContent = [
-        `# 📋 Gemini Live Translate — AI 회의록 (Meeting Minutes)`,
-        ``,
-        `- **생성 일시**: ${nowDisplay}`,
-        `- **Source 언어**: ${srcLabel}`,
-        `- **Target 언어**: ${tgtLabel}`,
-        ``,
-        `---`,
-        ``,
-        state.summaryMarkdown,
-        ``,
-      ].join("\n");
+  function scheduleReconnect() {
+    if (!state.userWantsSession) return;
+    if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+    state.reconnectAttempts += 1;
+    if (state.reconnectAttempts > 8) {
+      stopSession(false, "reconnect_exhausted");
+      setStatus("error", "연결 끊김");
+      showToast("네트워크 연결이 끊어져 번역 세션이 종료되었습니다. 비디오를 다시 선택해 주세요.");
+      return;
+    }
+    const delay = Math.min(4000, 600 * Math.pow(1.5, state.reconnectAttempts - 1));
+    setStatus("connecting", `연결 복구 중 (${state.reconnectAttempts})...`);
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = null;
+      openWebSocket();
+    }, delay);
+  }
 
-      const filename = `live_translate_summary_${getTimestampFilenameSuffix()}.md`;
-      triggerFileDownload(filename, mdContent, "text/markdown;charset=utf-8");
-      showToast("AI 회의록(.md) 파일이 저장되었습니다.");
-    } catch (err) {
-      console.error("Meeting summary error:", err);
-      showToast(`회의록 생성에 실패했습니다: ${err.message}`);
-    } finally {
-      state.isSummarizing = false;
-      dom.btnSummary.disabled = false;
-      if (dom.summaryBtnIcon) dom.summaryBtnIcon.textContent = "auto_awesome";
-      if (dom.summaryBtnLabel) dom.summaryBtnLabel.textContent = "회의 요약";
+  function stopSession(sendStop = true, reason = "stop") {
+    state.userWantsSession = false;
+    state.isSending = false;
+    state.sessionConnected = false;
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
+    if (state.ws) {
+      try {
+        if (sendStop && state.ws.readyState === WebSocket.OPEN) {
+          state.ws.send(JSON.stringify({ type: "stop", reason }));
+        }
+        state.ws.onclose = null;
+        state.ws.close();
+      } catch (_) {}
+      state.ws = null;
+    }
+    if (reason !== "video_ended") setStatus("idle", "대기 중");
+  }
+
+  function pushConfigUpdate(label) {
+    resetTranslationState(label);
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      try {
+        state.ws.send(
+          JSON.stringify({
+            type: "update_config",
+            target_lang: state.settings.targetLang,
+            echo_target_language: state.settings.echoTargetLanguage,
+            voice: state.settings.voice || "auto",
+          })
+        );
+      } catch (_) {}
+    } else if (state.userWantsSession) {
+      openWebSocket();
     }
   }
 
-  /**
-   * "원문/번역문 저장" 버튼 클릭 시:
-   * 원문(Source) 전체를 먼저 기록하고, 이후에 번역문(Target) 전체를 분리하여 기록한 마크다운(.md) 파일을 즉시 저장합니다.
-   */
-  function downloadTranscriptMd() {
-    const srcText = getPanelFullText("source");
-    const tgtText = getPanelFullText("target");
-    if (!srcText && !tgtText) {
-      showToast("저장할 원문/번역문 기록이 없습니다.");
+  function handleServerMessage(raw) {
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch (_) {
       return;
     }
 
-    const nowDisplay = new Date().toLocaleString("ko-KR");
-    const srcLabel = formatLanguageLabel(dom.sourceLangSelect.value);
-    const tgtLabel = formatLanguageLabel(dom.targetLangSelect.value);
-
-    const mdLines = [
-      `# 🌐 Gemini Live Translate — 원문 및 번역문 기록`,
-      ``,
-      `- **저장 일시**: ${nowDisplay}`,
-      `- **Source 언어**: ${srcLabel}`,
-      `- **Target 언어**: ${tgtLabel}`,
-      ``,
-      `---`,
-      ``,
-      `## 🎙️ 원문 (Source — ${srcLabel})`,
-      ``,
-      srcText ? srcText : "_기록된 원문이 없습니다._",
-      ``,
-      `---`,
-      ``,
-      `## 🌍 번역문 (Target — ${tgtLabel})`,
-      ``,
-      tgtText ? tgtText : "_기록된 번역문이 없습니다._",
-      ``,
-    ];
-
-    const filename = `live_translate_transcript_${getTimestampFilenameSuffix()}.md`;
-    triggerFileDownload(
-      filename,
-      mdLines.join("\n"),
-      "text/markdown;charset=utf-8"
-    );
-    showToast("원문/번역문 마크다운(.md) 파일이 저장되었습니다.");
-  }
-
-  function triggerFileDownload(filename, content, mimeType) {
-    const blob = new Blob([content], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
-
-  // =========================================================================
-  // 10. Utilities (Session Status, Timer, Clipboard, Floating Toast)
-  // =========================================================================
-
-  function setSessionStatus(stateCode, labelText) {
-    dom.sessionStatusPill.setAttribute("data-state", stateCode);
-    dom.sessionStatusText.textContent = labelText;
-  }
-
-  function startSessionTimer() {
-    stopSessionTimer();
-    state.sessionStartTime = Date.now();
-    dom.sessionTimer.hidden = false;
-    dom.sessionTimer.textContent = "00:00";
-
-    state.sessionTimerInterval = setInterval(() => {
-      const elapsedSec = Math.floor(
-        (Date.now() - state.sessionStartTime) / 1000
-      );
-      const mins = String(Math.floor(elapsedSec / 60)).padStart(2, "0");
-      const secs = String(elapsedSec % 60).padStart(2, "0");
-      dom.sessionTimer.textContent = `${mins}:${secs}`;
-    }, 1000);
-  }
-
-  function stopSessionTimer() {
-    if (state.sessionTimerInterval) {
-      clearInterval(state.sessionTimerInterval);
-      state.sessionTimerInterval = null;
-    }
-    dom.sessionTimer.hidden = true;
-  }
-
-  function formatTimeHHMMSS(date) {
-    const pad = (n) => String(n).padStart(2, "0");
-    return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(
-      date.getSeconds()
-    )}`;
-  }
-
-  async function copyToClipboard(text, successMsg) {
-    try {
-      await navigator.clipboard.writeText(text);
-      showToast(successMsg);
-    } catch (_) {
-      showToast("클립보드 복사에 실패했습니다.");
+    switch (msg.type) {
+      case "status": {
+        if (msg.status === "connected") {
+          state.sessionConnected = true;
+          setStatus("connected", dom.video.paused ? "준비됨" : "실시간 번역 중");
+        } else {
+          setStatus("connecting", "세션 연결 중...");
+        }
+        break;
+      }
+      case "input_transcription": {
+        if (msg.language_code) updateDetectedLanguage(msg.language_code);
+        if (msg.text) updateSourceSubtitle(msg.text, Boolean(msg.finished), Boolean(msg.interim));
+        if (!dom.video.paused) setStatus("connected", "실시간 번역 중");
+        break;
+      }
+      case "output_transcription": {
+        if (msg.text) updateTargetSubtitle(msg.text, Boolean(msg.finished));
+        break;
+      }
+      case "turn_complete": {
+        if (msg.turn_complete) finalizeTargetSubtitle();
+        break;
+      }
+      case "go_away": {
+        showToast("세션 수명 만료 알림 — 자동으로 연장합니다.");
+        break;
+      }
+      case "inactive_timeout": {
+        stopSession(false, "inactive_timeout");
+        showToast(msg.message || "장시간 입력이 없어 세션이 종료되었습니다.");
+        break;
+      }
+      case "session_closed": {
+        // Server acknowledged our explicit stop/restart; nothing else to do
+        break;
+      }
+      case "config_updated":
+        break;
+      case "error": {
+        setStatus("error", "연결 오류");
+        showToast(msg.message || "오류가 발생했습니다.");
+        break;
+      }
+      default:
+        break;
     }
   }
 
-  function showToast(message) {
-    if (!dom.toastMessage) return;
-    dom.toastMessage.textContent = message;
-    dom.toastMessage.hidden = false;
-    if (toastTimeoutId) clearTimeout(toastTimeoutId);
-    toastTimeoutId = setTimeout(() => {
-      dom.toastMessage.textContent = "";
-      dom.toastMessage.hidden = true;
-    }, 3500);
+  function updateDetectedLanguage(code) {
+    dom.detectedLang.classList.add("is-detected");
+    dom.detectedLangText.textContent = formatLanguageLabel(code);
   }
 
-  // Boot application
-  document.addEventListener("DOMContentLoaded", initApp);
+  // =========================================================================
+  // Subtitles (max 2 lines overlay)
+  // =========================================================================
+
+  function updateSourceSubtitle(text, finished, interim) {
+    if (interim) {
+      state.sourceActive = text;
+    } else {
+      state.sourceActive = finished ? text : (state.sourceActive.endsWith(text) ? state.sourceActive : state.sourceActive + text);
+      if (/[.?!。？！]\s*$/.test(state.sourceActive)) {
+        // keep the finished sentence until target catches up; next chunk starts fresh
+        const done = state.sourceActive;
+        state.sourceActive = "";
+        state.sourceLastSentence = done;
+      }
+    }
+    renderSubtitles();
+  }
+
+  function updateTargetSubtitle(chunk, finished) {
+    let active = state.activeTarget;
+    if (!active) {
+      active = { text: "", timer: null };
+      state.activeTarget = active;
+    }
+    active.text += chunk;
+    if (active.timer) clearTimeout(active.timer);
+
+    const endsSentence = /[.?!。？！]\s*$/.test(active.text);
+    if (finished || endsSentence) {
+      finalizeTargetSubtitle();
+    } else {
+      active.timer = setTimeout(finalizeTargetSubtitle, SUBTITLE_FINALIZE_MS);
+    }
+    renderSubtitles();
+  }
+
+  function finalizeTargetSubtitle() {
+    const active = state.activeTarget;
+    if (!active) return;
+    if (active.timer) clearTimeout(active.timer);
+    const text = active.text.trim();
+    state.activeTarget = null;
+    if (text) {
+      state.targetLines.push(text);
+      if (state.targetLines.length > 4) state.targetLines.splice(0, state.targetLines.length - 4);
+    }
+    renderSubtitles();
+  }
+
+  function clearSubtitles() {
+    if (state.activeTarget?.timer) clearTimeout(state.activeTarget.timer);
+    state.activeTarget = null;
+    state.targetLines = [];
+    state.sourceActive = "";
+    state.sourceLastSentence = "";
+    if (state.subtitleHideTimer) clearTimeout(state.subtitleHideTimer);
+    dom.subtitleTarget.textContent = "";
+    dom.subtitleSource.textContent = "";
+    dom.subtitleOverlay.classList.remove("is-visible");
+  }
+
+  function renderSubtitles() {
+    const overlay = dom.subtitleOverlay;
+    const targetEl = dom.subtitleTarget;
+    const sourceEl = dom.subtitleSource;
+
+    // Candidate lines: last committed + active (active sentence is highlighted)
+    const activeText = state.activeTarget ? state.activeTarget.text.trim() : "";
+    const committed = state.targetLines.slice(activeText ? -1 : -2);
+    const lines = [...committed];
+    if (activeText) lines.push(activeText);
+
+    targetEl.innerHTML = "";
+    lines.forEach((t, i) => {
+      const span = document.createElement("span");
+      span.className = "sub-line" + (activeText && i === lines.length - 1 ? " is-active" : "");
+      span.textContent = t;
+      targetEl.appendChild(span);
+    });
+
+    // Enforce max 2 visual lines: drop the oldest line, then trim the head of a long sentence
+    const maxHeight = getSubtitleMaxHeight(targetEl);
+    let guard = 0;
+    while (targetEl.scrollHeight > maxHeight + 2 && targetEl.children.length > 1 && guard++ < 4) {
+      targetEl.removeChild(targetEl.firstElementChild);
+    }
+    guard = 0;
+    while (targetEl.scrollHeight > maxHeight + 2 && targetEl.children.length === 1 && guard++ < 60) {
+      const only = targetEl.firstElementChild;
+      const words = only.textContent.replace(/^…\s*/, "").split(/\s+/);
+      if (words.length <= 2) {
+        // CJK text without spaces: trim characters
+        const chars = only.textContent.replace(/^…/, "");
+        if (chars.length <= 4) break;
+        only.textContent = "…" + chars.slice(Math.ceil(chars.length * 0.15));
+      } else {
+        only.textContent = "… " + words.slice(Math.max(1, Math.ceil(words.length * 0.15))).join(" ");
+      }
+    }
+
+    // Source line (optional)
+    if (state.settings.showSource) {
+      const src = state.sourceActive || state.sourceLastSentence || "";
+      sourceEl.textContent = src;
+      sourceEl.hidden = !src;
+    } else {
+      sourceEl.hidden = true;
+    }
+
+    const hasContent = targetEl.children.length > 0 || (!sourceEl.hidden && sourceEl.textContent);
+    overlay.classList.toggle("is-visible", Boolean(hasContent));
+
+    if (state.subtitleHideTimer) clearTimeout(state.subtitleHideTimer);
+    if (hasContent) {
+      state.subtitleHideTimer = setTimeout(() => {
+        overlay.classList.remove("is-visible");
+      }, SUBTITLE_IDLE_HIDE_MS);
+    }
+  }
+
+  function getSubtitleMaxHeight(el) {
+    const cs = getComputedStyle(el);
+    let lh = parseFloat(cs.lineHeight);
+    if (!Number.isFinite(lh)) lh = parseFloat(cs.fontSize) * 1.35;
+    const pad = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+    return lh * 2 + pad;
+  }
+
+  // =========================================================================
+  // Read-only debug hook (DevTools): window.__lvt.debug()
+  window.__lvt = {
+    debug: () => ({
+      ctxState: state.audioCtx?.state,
+      sampleRate: state.audioCtx?.sampleRate,
+      wsState: state.ws?.readyState,
+      isSending: state.isSending,
+      sessionConnected: state.sessionConnected,
+      scheduled: state.scheduledSources.size,
+      queuedSeconds: state.audioCtx ? Math.max(0, state.nextPlayTime - state.audioCtx.currentTime) : 0,
+      sourceGain: state.sourceGain?.gain.value,
+      targetGain: state.targetGain?.gain.value,
+      targetLines: state.targetLines.length,
+      rxChunks: state.rxChunks,
+      rxBytes: state.rxBytes,
+      rxLastPeak: state.rxLastPeak,
+      rxLoudChunks: state.rxLoudChunks,
+      settings: { ...state.settings },
+    }),
+  };
+
+  document.addEventListener("DOMContentLoaded", init);
 })();

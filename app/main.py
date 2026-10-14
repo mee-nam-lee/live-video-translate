@@ -7,11 +7,11 @@ import logging
 import secrets
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from google.genai import errors as genai_errors
 from google.genai import types
@@ -26,8 +26,11 @@ from app.config import (
     GOOGLE_CLOUD_PROJECT,
     INACTIVITY_TIMEOUT_SECONDS,
     LIVE_TRANSLATE_MODEL,
-    SUMMARY_MODEL,
     SUPPORTED_LANGUAGES,
+    SUPPORTED_VOICES,
+    VALID_VOICE_IDS,
+    VIDEOS_GCS_BUCKET,
+    VIDEOS_GCS_PREFIX,
     create_genai_client,
 )
 
@@ -41,9 +44,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(
-    title="Google Gemini 3.5 Live Translate",
-    description="Real-time Speech-to-Speech & Transcript Live Translation powered by gemini-3.5-live-translate-preview",
-    version="1.0.0",
+    title="Google Gemini 3.5 Live Video Translate",
+    description="Real-time video dubbing & subtitle translation powered by gemini-3.5-live-translate-preview",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -107,17 +110,19 @@ class LoginRequest(BaseModel):
 
 @app.middleware("http")
 async def disable_static_cache(request, call_next):
-    # Redirect 0.0.0.0 to localhost so browsers treat the page as a Secure Context for getUserMedia
+    # Redirect 0.0.0.0 to localhost so browsers treat the page as a Secure Context
     host = request.headers.get("host", "")
     if host.startswith("0.0.0.0"):
         new_url = str(request.url).replace("://0.0.0.0", "://localhost", 1)
         return RedirectResponse(url=new_url, status_code=307)
 
-    # Login gate: everything except login page/API and static assets requires a valid cookie
+    # Login gate: everything except login page/API and static UI assets requires a valid cookie.
+    # Video media (/media/*) and APIs are intentionally NOT public.
     path = request.url.path
-    if LOGIN_ENABLED and not path.startswith(PUBLIC_PATH_PREFIXES):
+    is_public = path.startswith(PUBLIC_PATH_PREFIXES)
+    if LOGIN_ENABLED and not is_public:
         if not _is_authenticated(request.cookies):
-            if path.startswith("/api/"):
+            if path.startswith("/api/") or path.startswith("/media/"):
                 return JSONResponse(
                     status_code=401, content={"detail": "로그인이 필요합니다."}
                 )
@@ -165,155 +170,191 @@ async def api_logout():
     return response
 
 
-class TranscriptEntry(BaseModel):
-    role: str  # "source" or "target"
-    text: str
-    timestamp: Optional[str] = None
-    lang: Optional[str] = None
-
-
-class SummarizeRequest(BaseModel):
-    entries: List[TranscriptEntry]
-    source_lang: str = "en"
-    target_lang: str = "ko"
-    api_key: Optional[str] = None
-
-
 @app.get("/api/config")
 async def get_config():
-    """Return application configuration and supported languages."""
+    """Return application configuration, supported languages and voice presets."""
     return {
         "auth_mode": AUTH_MODE,
         "project": GOOGLE_CLOUD_PROJECT,
         "location": GOOGLE_CLOUD_LOCATION,
         "live_translate_model": LIVE_TRANSLATE_MODEL,
-        "summary_model": SUMMARY_MODEL,
         "inactivity_timeout_seconds": INACTIVITY_TIMEOUT_SECONDS,
-        "default_source_language": "en",
         "default_target_language": "ko",
         "echo_target_language": True,
         "supported_languages": SUPPORTED_LANGUAGES,
+        "supported_voices": SUPPORTED_VOICES,
+        "video_source": f"gs://{VIDEOS_GCS_BUCKET}/{VIDEOS_GCS_PREFIX}".rstrip("/") if VIDEOS_GCS_BUCKET else "local",
     }
 
 
-@app.post("/api/summarize")
-async def summarize_meeting(req: SummarizeRequest):
-    """Generate comprehensive, length-adaptive Meeting Minutes (회의록) from the accumulated transcript."""
-    if not req.entries:
-        raise HTTPException(status_code=400, detail="요약할 대화 내용이 없습니다.")
+# ---------------------------------------------------------------------------
+# Video catalogue & media delivery.
+#
+# Source: a GCS bucket (VIDEOS_GCS_BUCKET) or, when unset, the local videos/ folder.
+# Every media response is capped at MEDIA_CHUNK_BYTES and returned as 206 so a
+# single response never exceeds Cloud Run's 32 MiB non-chunked limit; browsers
+# simply keep requesting subsequent ranges.
+# ---------------------------------------------------------------------------
+VIDEOS_DIR = BASE_DIR / "videos"
+MEDIA_CHUNK_BYTES = 8 * 1024 * 1024
+MEDIA_READ_BLOCK = 1024 * 1024
+MEDIA_TYPES = {".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime", ".m4v": "video/x-m4v"}
+GCS_META_TTL_SECONDS = 600
 
-    # Format transcript lines clearly for summarization and measure conversation scale
-    formatted_lines = []
-    timestamps = []
-    source_chars = 0
-    target_chars = 0
-    source_count = 0
-    target_count = 0
-    for item in req.entries:
-        text = item.text.strip()
-        if not text:
-            continue
-        if item.role == "source":
-            source_chars += len(text)
-            source_count += 1
-            role_label = "원문(Source)"
-        else:
-            target_chars += len(text)
-            target_count += 1
-            role_label = "번역(Target)"
-        if item.timestamp:
-            timestamps.append(item.timestamp)
-        ts = f"[{item.timestamp}] " if item.timestamp else ""
-        lang_tag = f"({item.lang}) " if item.lang else ""
-        formatted_lines.append(f"{ts}{role_label} {lang_tag}: {text}")
+_gcs_client = None
+_gcs_meta_cache: dict[str, tuple[float, int]] = {}  # object name -> (cached_at, size)
 
-    if not formatted_lines:
-        raise HTTPException(status_code=400, detail="유효한 텍스트 내용이 없습니다.")
 
-    turn_count = max(source_count, target_count)
-    base_chars = target_chars if target_chars > 0 else source_chars
-    # Hard ceiling for the generated minutes: roughly 70% of the single-language transcript length
-    max_summary_chars = max(150, int(base_chars * 0.7))
-    time_span_info = (
-        f"{timestamps[0]} ~ {timestamps[-1]}" if len(timestamps) >= 2 else "실시간 세션"
-    )
-    transcript_block = "\n".join(formatted_lines)
+def _gcs_object_name(filename: str) -> str:
+    return f"{VIDEOS_GCS_PREFIX}/{filename}" if VIDEOS_GCS_PREFIX else filename
 
-    prompt = f"""# 역할
-당신은 글로벌 비즈니스 회의 및 기술 논의를 정리하는 전문 **실무 회의록(Meeting Minutes) 작성자**입니다.
-아래 [대화 기록]은 실시간 통역(Live Translate) 세션에서 기록된 원문(Source)과 번역문(Target)입니다.
-원문과 번역문은 동일한 발화를 두 언어로 기록한 것이므로, 내용 파악 시 **번역문을 기준으로 하고 원문은 보조 참고**로만 사용하세요.
 
-# 대화 기록 지표
-- 발화 수: 약 {turn_count}문장
-- 번역문 기준 분량: 약 {base_chars}자
-- 시간대: {time_span_info}
-- **회의록 최대 허용 분량: {max_summary_chars}자** (번역문 분량의 약 70%)
+def _gcs_bucket():
+    """Lazily create the Storage client (ADC) and return the configured bucket."""
+    global _gcs_client
+    if _gcs_client is None:
+        from google.cloud import storage  # imported lazily so local mode works without the package
 
-# 작성 원칙
+        _gcs_client = storage.Client(project=GOOGLE_CLOUD_PROJECT or None)
+    return _gcs_client.bucket(VIDEOS_GCS_BUCKET)
 
-## 1. 분량 — 번역문 분량에 비례하여 압축
-- 회의록은 원본을 압축·구조화하는 문서이므로 **어떤 경우에도 번역문 분량({base_chars}자)보다 길어서는 안 되며, 위 최대 허용 분량({max_summary_chars}자)을 넘지 마세요.**
-- 분량이 적은 대화일수록 더 간결하게, 분량이 많은 대화일수록 누락 없이 상세하게 작성하되 항상 원본보다 짧게 유지하세요.
-- 핵심과 무관한 잡담(인사, 화면/슬라이드 확인, 추임새 등)은 회의록에서 제외하세요.
 
-## 2. 구조 — 대화의 주제 수에 맞게 유연하게 조절
-- 아래 3개 섹션(`###`)은 항상 유지하세요.
-- 2번 섹션 안에서 논의 주제가 **명확히 여러 개로 구분되는 경우에만** `#### 1) [안건명]` 소제목으로 나누고, 주제가 하나이거나 대화가 짧으면 소제목 없이 불릿(`- `)만 사용하세요.
-- 같은 내용을 1번(개요), 2번(논의), 3번(결정)에 반복해서 쓰지 마세요.
+def _gcs_object_size(object_name: str) -> Optional[int]:
+    """Blocking: fetch (and cache) the object size, or None if it does not exist."""
+    now = time.monotonic()
+    cached = _gcs_meta_cache.get(object_name)
+    if cached and now - cached[0] < GCS_META_TTL_SECONDS:
+        return cached[1]
+    blob = _gcs_bucket().get_blob(object_name)
+    if blob is None or blob.size is None:
+        return None
+    _gcs_meta_cache[object_name] = (now, int(blob.size))
+    return int(blob.size)
 
-## 3. 사실성 — 기록에 있는 내용만 작성
-- 대화 기록에 없는 배경·수치·결정 사항·Action Item을 추론하여 지어내지 마세요.
-- 결정 사항이나 후속 조치가 언급되지 않았다면 억지로 도출하지 말고 `별도 결정 사항 없음` / `별도 후속 조치 언급 없음`으로 표기하세요.
-- **약어·고유명사 임의 풀이 금지**: 실시간 음성 인식(STT) 특성상 영문 약어나 고유명사(예: `IDV`)는 발음 유사성으로 오인식되었을 수 있습니다. 대화 기록에 풀네임이나 정의가 직접 언급되지 않았다면, **괄호 안에 임의의 영문 풀네임이나 용어 설명을 추측하여 붙이지 말고 기록된 표기 그대로만** 사용하세요.
 
-## 4. 언어
-- 한국어(또는 Target 언어: `{req.target_lang}`)로 작성하세요.
+def _gcs_read_range(object_name: str, start: int, end: int) -> bytes:
+    """Blocking: download bytes [start, end] inclusive."""
+    return _gcs_bucket().blob(object_name).download_as_bytes(start=start, end=end)
 
-# 출력 형식 (Markdown)
 
-### 📋 1. 회의 핵심 주제 및 종합 개요
-- **핵심 주제**: 이번 대화가 다룬 핵심 주제 (1줄)
-- **요약 개요**: 전체 논의 흐름과 핵심 요지 (대화 분량에 비례하여 서술)
-
-### 💬 2. 주요 안건별 상세 논의 사항
-- 논의된 핵심 내용을 개조식 불릿(`- `)으로 정리 (주제가 여러 개인 경우에만 `#### 1) [안건명]` 소제목 사용)
-
-### ✅ 3. 결정 사항 및 Action Items
-- **결정/합의 사항**: 대화 중 확정되거나 합의된 내용
-- **Action Items**: 대화에서 실제로 언급된 후속 조치나 할 일 (담당자·기한이 언급된 경우에만 함께 표기)
-
----
-[대화 기록]
-{transcript_block}
-"""
-
+def _parse_range(header: Optional[str], size: int):
+    """Return (start, end) inclusive for a single-range header, or None for full content."""
+    if not header or not header.startswith("bytes="):
+        return None
+    spec = header[6:].split(",")[0].strip()
+    if "-" not in spec:
+        return None
+    start_s, end_s = spec.split("-", 1)
     try:
-        client = create_genai_client(api_key_override=req.api_key)
-        response = await client.aio.models.generate_content(
-            model=SUMMARY_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=8192,
-            ),
-        )
-        summary_text = response.text or "회의록을 생성하지 못했습니다."
-        return {
-            "summary": summary_text,
-            "model": SUMMARY_MODEL,
-        }
-    except Exception as exc:
-        logger.exception("Failed to generate meeting summary")
-        raise HTTPException(
-            status_code=500,
-            detail=f"회의 요약 생성 중 오류가 발생했습니다: {str(exc)}",
-        ) from exc
+        if start_s == "":
+            # suffix range: last N bytes
+            length = int(end_s)
+            if length <= 0:
+                return None
+            return max(0, size - length), size - 1
+        start = int(start_s)
+        end = int(end_s) if end_s else size - 1
+    except ValueError:
+        return None
+    if start >= size or start < 0:
+        return "unsatisfiable"
+    return start, min(end, size - 1)
+
+
+@app.get("/api/videos")
+async def list_videos():
+    """Return the video catalogue (videos.json) from GCS or the local folder."""
+    if VIDEOS_GCS_BUCKET:
+        try:
+            raw = await asyncio.to_thread(
+                lambda: _gcs_bucket().blob(_gcs_object_name("videos.json")).download_as_bytes()
+            )
+            data = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            logger.error("Failed to load videos.json from gs://%s: %s", VIDEOS_GCS_BUCKET, exc)
+            raise HTTPException(status_code=502, detail="비디오 목록을 GCS에서 불러오지 못했습니다.") from exc
+    else:
+        local = VIDEOS_DIR / "videos.json"
+        if not local.is_file():
+            return {"videos": [], "source": "local"}
+        data = json.loads(local.read_text(encoding="utf-8"))
+    videos = [v for v in data.get("videos", []) if isinstance(v, dict) and v.get("file")]
+    return {"videos": videos, "source": f"gs://{VIDEOS_GCS_BUCKET}" if VIDEOS_GCS_BUCKET else "local"}
+
+
+@app.get("/media/{filename}")
+async def serve_media(filename: str, request: Request):
+    safe_name = Path(filename).name
+    suffix = Path(safe_name).suffix.lower()
+    if safe_name != filename or suffix not in MEDIA_TYPES:
+        raise HTTPException(status_code=404, detail="Video not found")
+    media_type = MEDIA_TYPES[suffix]
+
+    # Resolve size from the configured source
+    if VIDEOS_GCS_BUCKET:
+        object_name = _gcs_object_name(safe_name)
+        try:
+            size = await asyncio.to_thread(_gcs_object_size, object_name)
+        except Exception as exc:
+            logger.error("GCS metadata error for %s: %s", object_name, exc)
+            raise HTTPException(status_code=502, detail="비디오 저장소에 접근할 수 없습니다.") from exc
+        if size is None:
+            raise HTTPException(status_code=404, detail="Video not found")
+        file_path = None
+    else:
+        file_path = (VIDEOS_DIR / safe_name).resolve()
+        if VIDEOS_DIR.resolve() not in file_path.parents or not file_path.is_file():
+            raise HTTPException(status_code=404, detail="Video not found")
+        size = file_path.stat().st_size
+        object_name = None
+
+    parsed = _parse_range(request.headers.get("range"), size)
+    if parsed == "unsatisfiable":
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
+
+    if parsed is None:
+        start, end = 0, min(size, MEDIA_CHUNK_BYTES) - 1
+    else:
+        start, end = parsed
+        end = min(end, start + MEDIA_CHUNK_BYTES - 1)
+    length = end - start + 1
+
+    async def iter_gcs():
+        pos = start
+        while pos <= end:
+            block_end = min(end, pos + MEDIA_READ_BLOCK - 1)
+            data = await asyncio.to_thread(_gcs_read_range, object_name, pos, block_end)
+            if not data:
+                break
+            pos += len(data)
+            yield data
+
+    def iter_local():
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                block = f.read(min(MEDIA_READ_BLOCK, remaining))
+                if not block:
+                    break
+                remaining -= len(block)
+                yield block
+
+    headers = {
+        "Content-Range": f"bytes {start}-{end}/{size}",
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(length),
+        "Cache-Control": "private, max-age=3600",
+    }
+    body = iter_gcs() if VIDEOS_GCS_BUCKET else iter_local()
+    # Always 206 so that no single response exceeds the platform size limit.
+    return StreamingResponse(body, status_code=206, media_type=media_type, headers=headers)
 
 
 def build_live_connect_config(
     target_language_code: str,
     echo_target_language: bool = True,
+    voice_name: Optional[str] = None,
     session_handle: Optional[str] = None,
     enable_session_management: bool = True,
 ) -> types.LiveConnectConfig:
@@ -322,7 +363,8 @@ def build_live_connect_config(
     Includes:
     - response_modalities=["AUDIO"]
     - input_audio_transcription & output_audio_transcription
-    - translation_config (target_language_code, echo_target_language=True)
+    - translation_config (target_language_code, echo_target_language)
+    - optional speech_config (prebuilt voice) when voice_name is not "auto"
     - context_window_compression (SlidingWindow) & session_resumption (handle)
     """
     kwargs = {
@@ -334,6 +376,13 @@ def build_live_connect_config(
             echo_target_language=echo_target_language,
         ),
     }
+
+    if voice_name and voice_name != "auto":
+        kwargs["speech_config"] = types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+            )
+        )
 
     if enable_session_management:
         kwargs["context_window_compression"] = types.ContextWindowCompressionConfig(
@@ -366,15 +415,15 @@ def _cleanup_expired_sessions() -> None:
 @app.websocket("/ws/translate")
 async def websocket_translate(websocket: WebSocket):
     """
-    Bidirectional WebSocket endpoint bridging browser audio/UI with
+    Bidirectional WebSocket endpoint bridging browser video audio/UI with
     Gemini 3.5 Live Translate (gemini-3.5-live-translate-preview).
     Implements:
-    - Automatic session resumption (SessionResumptionConfig) & GoAway handling for 2+ hour meetings
-    - Client session_id handle persistence across mobile network/app switches
+    - Binary downstream frames carrying translated 24kHz PCM audio
+    - Automatic session resumption (SessionResumptionConfig) & GoAway handling
+    - Client session_id handle persistence across network drops
     - Context window compression (SlidingWindow)
-    - 10-minute inactivity timeout auto-termination
-    - Explicit session termination when the meeting ends
-    - Seamless mid-session language switching
+    - Inactivity timeout auto-termination
+    - Seamless mid-session target language / voice switching
     """
     # Login gate for WebSocket (HTTP middleware does not run for WS upgrades)
     if not _is_authenticated(websocket.cookies):
@@ -386,28 +435,30 @@ async def websocket_translate(websocket: WebSocket):
 
     query = websocket.query_params
     session_id = (query.get("session_id") or "").strip()
-    source_lang = query.get("source_lang", "en")
     target_lang = query.get("target_lang", "ko")
     echo_str = query.get("echo_target_language", "true").lower()
     echo_target_language = echo_str != "false"
+    voice_name = (query.get("voice") or "auto").strip()
+    if voice_name not in VALID_VOICE_IDS:
+        voice_name = "auto"
     api_key_override = query.get("api_key") or None
 
-    # Restore previous resumption handle if this client is reconnecting with the same target language
+    # Restore previous resumption handle if this client is reconnecting with the same translation config
     prior_handle: Optional[str] = None
     if session_id and session_id in RESUMABLE_SESSIONS:
         saved = RESUMABLE_SESSIONS[session_id]
-        if saved.get("target_lang") == target_lang:
+        if saved.get("target_lang") == target_lang and saved.get("voice") == voice_name:
             prior_handle = saved.get("handle")
 
-    # Queue for 16kHz PCM audio chunks coming from browser microphone
+    # Queue for 16kHz PCM audio chunks coming from the browser video element
     audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=300)
 
     # Shared state across seamless session reconnections
     session_state = {
         "session_id": session_id,
-        "source_lang": source_lang,
         "target_lang": target_lang,
         "echo_target_language": echo_target_language,
+        "voice": voice_name,
         "resumption_handle": prior_handle,
         "explicitly_stopped": False,
         "enable_session_management": True,
@@ -424,6 +475,14 @@ async def websocket_translate(websocket: WebSocket):
             return
         try:
             await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            session_state["client_disconnected"] = True
+
+    async def send_ws_bytes(payload: bytes):
+        if session_state["client_disconnected"]:
+            return
+        try:
+            await websocket.send_bytes(payload)
         except Exception:
             session_state["client_disconnected"] = True
 
@@ -449,7 +508,7 @@ async def websocket_translate(websocket: WebSocket):
                         {
                             "type": "inactive_timeout",
                             "timeout_seconds": INACTIVITY_TIMEOUT_SECONDS,
-                            "message": f"{mins}분 이상 음성 입력 및 대화가 없어 세션이 자동으로 종료되었습니다.",
+                            "message": f"{mins}분 이상 오디오 입력이 없어 세션이 자동으로 종료되었습니다.",
                         }
                     )
                     session_state["client_disconnected"] = True
@@ -496,43 +555,47 @@ async def websocket_translate(websocket: WebSocket):
                             await audio_queue.put(pcm_bytes)
 
                     elif msg_type == "activity":
-                        # Voice activity detected on client microphone
+                        # Client reports audible source activity (keeps inactivity watchdog alive)
                         session_state["last_activity_ts"] = time.monotonic()
 
                     elif msg_type == "update_config":
                         session_state["last_activity_ts"] = time.monotonic()
-                        new_source = data.get("source_lang", session_state["source_lang"])
                         new_target = data.get("target_lang", session_state["target_lang"])
                         new_echo = data.get(
                             "echo_target_language", session_state["echo_target_language"]
                         )
+                        new_voice = (data.get("voice") or session_state["voice"]).strip()
+                        if new_voice not in VALID_VOICE_IDS:
+                            new_voice = session_state["voice"]
 
-                        target_changed = new_target != session_state["target_lang"] or (
-                            bool(new_echo) != bool(session_state["echo_target_language"])
+                        config_changed = (
+                            new_target != session_state["target_lang"]
+                            or bool(new_echo) != bool(session_state["echo_target_language"])
+                            or new_voice != session_state["voice"]
                         )
-                        session_state["source_lang"] = new_source
                         session_state["target_lang"] = new_target
                         session_state["echo_target_language"] = bool(new_echo)
+                        session_state["voice"] = new_voice
 
-                        if target_changed:
-                            # Reset resumption handle when translation target config changes
+                        if config_changed:
+                            # Reset resumption handle when translation config changes
                             session_state["resumption_handle"] = None
                             if session_state["session_id"]:
                                 RESUMABLE_SESSIONS.pop(session_state["session_id"], None)
                             session_state["reconnect_requested"] = True
                             session_state["reconnect_reason"] = (
-                                f"Target 언어 변경 ({new_target})으로 세션을 재연결합니다."
+                                f"번역 설정 변경 (target={new_target}, voice={new_voice})으로 세션을 재연결합니다."
                             )
                             force_reconnect_event.set()
                         else:
                             await send_ws_json(
                                 {
                                     "type": "config_updated",
-                                    "source_lang": new_source,
                                     "target_lang": new_target,
                                     "echo_target_language": session_state[
                                         "echo_target_language"
                                     ],
+                                    "voice": new_voice,
                                 }
                             )
 
@@ -545,7 +608,7 @@ async def websocket_translate(websocket: WebSocket):
                             {
                                 "type": "session_closed",
                                 "reason": data.get("reason", "explicit_stop"),
-                                "message": "회의 종료 요청에 따라 Live API 세션이 명시적으로 종료되었습니다.",
+                                "message": "Live API 세션이 종료되었습니다.",
                             }
                         )
                         session_state["client_disconnected"] = True
@@ -638,6 +701,7 @@ async def websocket_translate(websocket: WebSocket):
                                     RESUMABLE_SESSIONS[session_state["session_id"]] = {
                                         "handle": update.new_handle,
                                         "target_lang": session_state["target_lang"],
+                                        "voice": session_state["voice"],
                                         "updated_at": time.monotonic(),
                                     }
                                 handle_preview = (
@@ -741,9 +805,13 @@ async def websocket_translate(websocket: WebSocket):
                                     }
                                 )
 
-                            # Model turn activity (pure subtitle mode — no audio output sent to client)
+                            # Model turn: translated speech (raw 16-bit PCM @ 24kHz) -> binary WS frame
                             if server_content.model_turn and server_content.model_turn.parts:
                                 session_state["last_activity_ts"] = time.monotonic()
+                                for part in server_content.model_turn.parts:
+                                    inline = getattr(part, "inline_data", None)
+                                    if inline and inline.data:
+                                        await send_ws_bytes(inline.data)
 
                             # Turn / Generation completion signals
                             if (
@@ -807,11 +875,13 @@ async def websocket_translate(websocket: WebSocket):
             force_reconnect_event.clear()
             target_lang_now = session_state["target_lang"]
             echo_now = session_state["echo_target_language"]
+            voice_now = session_state["voice"]
             handle_now = session_state["resumption_handle"]
 
             config = build_live_connect_config(
                 target_language_code=target_lang_now,
                 echo_target_language=echo_now,
+                voice_name=voice_now,
                 session_handle=handle_now,
                 enable_session_management=session_state["enable_session_management"],
             )
@@ -822,9 +892,9 @@ async def websocket_translate(websocket: WebSocket):
                     "type": "status",
                     "status": status_mode,
                     "model": LIVE_TRANSLATE_MODEL,
-                    "source_lang": session_state["source_lang"],
                     "target_lang": target_lang_now,
                     "echo_target_language": echo_now,
+                    "voice": voice_now,
                     "session_management": session_state["enable_session_management"],
                     "resumed": bool(handle_now),
                     "message": session_state["reconnect_reason"]
@@ -848,14 +918,14 @@ async def websocket_translate(websocket: WebSocket):
                             "type": "status",
                             "status": "connected",
                             "model": LIVE_TRANSLATE_MODEL,
-                            "source_lang": session_state["source_lang"],
                             "target_lang": target_lang_now,
                             "echo_target_language": echo_now,
+                            "voice": voice_now,
                             "session_management": session_state[
                                 "enable_session_management"
                             ],
                             "resumed": bool(handle_now),
-                            "message": "실시간 통역 세션이 활성화되었습니다.",
+                            "message": "실시간 번역 세션이 활성화되었습니다.",
                         }
                     )
                     await run_gemini_session(session)

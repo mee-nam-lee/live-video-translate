@@ -9,3 +9,7 @@ __pycache__/
 README.md
 biz_requirement.md
 docs/
+# Video media lives in GCS (VIDEOS_GCS_BUCKET); only videos.json is tracked
+videos/*.mp4
+videos/*.webm
+videos/*.mov
