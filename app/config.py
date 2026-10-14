@@ -62,9 +62,9 @@ def _float_env(name: str, default: float, lo: float, hi: float) -> float:
 
 
 PLAYOUT_DELAY_SECONDS: float = _float_env("PLAYOUT_DELAY_SECONDS", 4.0, 0.0, 10.0)
-# Extra per-channel delays applied client-side after model output arrives. Translated text and
-# audio arrive together, but text tends to lead audio by ~0.5-0.8s; use these to fine-tune each.
-SUBTITLE_EXTRA_DELAY_SECONDS: float = _float_env("SUBTITLE_EXTRA_DELAY_SECONDS", 0.5, 0.0, 5.0)
+# Extra per-channel delays applied client-side after model output arrives. Subtitles naturally
+# lead dubbing by ~0.5-0.8s (useful reading time); set SUBTITLE_EXTRA_DELAY_SECONDS to align them.
+SUBTITLE_EXTRA_DELAY_SECONDS: float = _float_env("SUBTITLE_EXTRA_DELAY_SECONDS", 0.0, 0.0, 5.0)
 DUBBING_EXTRA_DELAY_SECONDS: float = _float_env("DUBBING_EXTRA_DELAY_SECONDS", 0.0, 0.0, 5.0)
 
 # Translated-speech voice presets exposed in the settings UI.
