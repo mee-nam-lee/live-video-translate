@@ -41,7 +41,7 @@ GCS 버킷에 등록된 비디오를 선택해 재생하면 음성 언어를 자
    - 숨김 `<audio>` 피더가 **재생 위치보다 D초 앞선 오디오**를 모델에 먼저 보내고, 보이는 영상은 재생/탐색 시 D초 동안 "번역 준비 중" 후 시작
    - 모델 지연이 D 안에 흡수되어 자막·더빙이 발화와 거의 동시에 나옴. 방송 송출 지연 버퍼(5–10초)와 같은 원리라 라이브 스트림에도 동일하게 적용 가능
    - `0`으로 두면 즉시 재생하고 번역이 모델 지연만큼 뒤따름
-   - `SUBTITLE_EXTRA_DELAY_SECONDS`(기본 0): 자막은 더빙보다 0.5–0.8s 먼저 나와 읽을 시간을 주므로 기본값 유지 권장. 더빙에 정확히 맞추고 싶을 때만 0.5
+   - 자막은 더빙보다 0.5–0.8s 먼저 나와 읽을 시간을 줌
 6. **GCS 기반 비디오 저장소**
    - 비디오 파일과 `videos.json`을 GCS 버킷(`VIDEOS_GCS_BUCKET`)에서 읽어 **8 MiB 단위 206 Partial Content**로 스트리밍 (Cloud Run의 32 MiB 단일 응답 제한 회피, 탐색 지원)
    - 환경변수가 비어 있으면 로컬 `videos/` 폴더로 폴백
@@ -59,7 +59,7 @@ GCS 버킷에 등록된 비디오를 선택해 재생하면 음성 언어를 자
 | 청크 크기(20–250ms)·VAD 설정·세션 옵션 | 영향 없음 |
 | 텍스트 전용 모드 | 없음 — 번역 텍스트는 음성의 전사본이라 동시에 도착 |
 
-→ API 설정으로는 줄일 수 없으므로 `PLAYOUT_DELAY_SECONDS`(기본 4.0)로 흡수합니다. 4.0에서 더빙이 영상과 ±0.5s 이내로 맞고, 자막은 더빙보다 약간 먼저 나와 읽을 여유가 생깁니다 (더빙과 정확히 맞추려면 `SUBTITLE_EXTRA_DELAY_SECONDS=0.5`). 자막만 쓰고 더빙을 끈다면 3.0~3.5로 줄여도 됩니다.
+→ API 설정으로는 줄일 수 없으므로 `PLAYOUT_DELAY_SECONDS`(기본 4.0)로 흡수합니다. 4.0에서 더빙이 영상과 ±0.5s 이내로 맞고, 자막은 더빙보다 약간 먼저 나와 읽을 여유가 생깁니다. 자막만 쓰고 더빙을 끈다면 3.0~3.5로 줄여도 됩니다.
 
 ---
 
@@ -153,8 +153,6 @@ VIDEOS_GCS_PREFIX=
 
 # 송출 지연(초). 보이는 영상을 이만큼 늦추고 그만큼 앞선 오디오를 모델에 먼저 보내 자막/더빙 싱크를 맞춤 (0 = 끔)
 PLAYOUT_DELAY_SECONDS=4.0
-# 자막 추가 지연(초). 자막은 더빙보다 0.5–0.8s 먼저 나오며(읽을 시간), 더빙에 맞추려면 0.5
-SUBTITLE_EXTRA_DELAY_SECONDS=0
 ```
 
 | 변수 | 설명 |
@@ -165,7 +163,6 @@ SUBTITLE_EXTRA_DELAY_SECONDS=0
 | `VIDEOS_GCS_BUCKET` | 비디오 파일과 `videos.json`을 읽을 GCS 버킷 |
 | `VIDEOS_GCS_PREFIX` | 버킷 내 하위 경로 (선택) |
 | `PLAYOUT_DELAY_SECONDS` | 송출 지연(초, 0–10, 기본 4.0). 0이면 선행 피더 비활성 |
-| `SUBTITLE_EXTRA_DELAY_SECONDS` | 자막에만 추가로 거는 지연(초, 기본 0) |
 
 ---
 
@@ -198,7 +195,7 @@ Cloud Run 서비스 계정에 **`roles/aiplatform.user`** 와 버킷 읽기 권�
 ```bash
 # .env → env.yaml (예: KEY: "value" 형식)
 python3 - <<'EOF'
-keys=["AUTH_MODE","GOOGLE_CLOUD_PROJECT","GOOGLE_CLOUD_LOCATION","LIVE_TRANSLATE_MODEL","INACTIVITY_TIMEOUT_SECONDS","APP_LOGIN_PASSWORD","APP_SESSION_SECRET","APP_SESSION_HOURS","VIDEOS_GCS_BUCKET","VIDEOS_GCS_PREFIX","PLAYOUT_DELAY_SECONDS","SUBTITLE_EXTRA_DELAY_SECONDS"]
+keys=["AUTH_MODE","GOOGLE_CLOUD_PROJECT","GOOGLE_CLOUD_LOCATION","LIVE_TRANSLATE_MODEL","INACTIVITY_TIMEOUT_SECONDS","APP_LOGIN_PASSWORD","APP_SESSION_SECRET","APP_SESSION_HOURS","VIDEOS_GCS_BUCKET","VIDEOS_GCS_PREFIX","PLAYOUT_DELAY_SECONDS"]
 env={l.split("=",1)[0].strip():l.split("=",1)[1].strip() for l in open(".env") if "=" in l and not l.startswith("#")}
 open("env.yaml","w").write("".join(f'{k}: "{env[k]}"\n' for k in keys if env.get(k)))
 EOF

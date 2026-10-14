@@ -148,8 +148,6 @@
     // Lead feeder: hidden <audio> playing PLAYOUT_DELAY seconds ahead of the visible video.
     // Its output goes only to the capture worklet (never to the speakers).
     playoutDelay: 0,
-    subtitleExtraDelay: 0, // seconds, applied to transcription events after arrival
-    subtitleTimers: new Set(),
     feeder: null,
     feederSourceNode: null,
     feederGain: null,
@@ -296,11 +294,10 @@
       }
       const num = (v, max) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.min(Number(v), max) : 0);
       state.playoutDelay = num(cfg.playout_delay_seconds, 10);
-      state.subtitleExtraDelay = num(cfg.subtitle_extra_delay_seconds, 5);
       if (dom.playoutDelayTag) {
-        const parts = [state.playoutDelay > 0 ? `송출 지연 ${state.playoutDelay.toFixed(1)}s` : "송출 지연 없음"];
-        if (state.subtitleExtraDelay > 0) parts.push(`자막 +${state.subtitleExtraDelay.toFixed(1)}s`);
-        dom.playoutDelayTag.textContent = parts.join(" · ");
+        dom.playoutDelayTag.textContent = state.playoutDelay > 0
+          ? `송출 지연 ${state.playoutDelay.toFixed(1)}s (PLAYOUT_DELAY_SECONDS)`
+          : "송출 지연 없음 (PLAYOUT_DELAY_SECONDS=0)";
       }
     } catch (err) {
       console.warn("Failed to load /api/config, using fallbacks:", err);
@@ -1273,17 +1270,15 @@
       case "input_transcription": {
         if (msg.language_code) updateDetectedLanguage(msg.language_code);
         if (!dom.video.paused) setStatus("connected", "실시간 번역 중");
-        if (msg.text) {
-          deferSubtitle(() => updateSourceSubtitle(msg.text, Boolean(msg.finished), Boolean(msg.interim)));
-        }
+        if (msg.text) updateSourceSubtitle(msg.text, Boolean(msg.finished), Boolean(msg.interim));
         break;
       }
       case "output_transcription": {
-        if (msg.text) deferSubtitle(() => updateTargetSubtitle(msg.text, Boolean(msg.finished)));
+        if (msg.text) updateTargetSubtitle(msg.text, Boolean(msg.finished));
         break;
       }
       case "turn_complete": {
-        if (msg.turn_complete) deferSubtitle(finalizeTargetSubtitle);
+        if (msg.turn_complete) finalizeTargetSubtitle();
         break;
       }
       case "go_away": {
@@ -1366,23 +1361,7 @@
     renderSubtitles();
   }
 
-  // Apply the configured extra subtitle delay (0 = immediate), preserving event order
-  function deferSubtitle(fn) {
-    const ms = state.subtitleExtraDelay * 1000;
-    if (ms <= 0) {
-      fn();
-      return;
-    }
-    const id = setTimeout(() => {
-      state.subtitleTimers.delete(id);
-      fn();
-    }, ms);
-    state.subtitleTimers.add(id);
-  }
-
   function clearSubtitles() {
-    state.subtitleTimers.forEach((id) => clearTimeout(id));
-    state.subtitleTimers.clear();
     if (state.activeTarget?.timer) clearTimeout(state.activeTarget.timer);
     state.activeTarget = null;
     state.targetLines = [];
@@ -1478,7 +1457,6 @@
       targetGain: state.targetGain?.gain.value,
       targetLines: state.targetLines.length,
       playoutDelay: state.playoutDelay,
-      subtitleExtraDelay: state.subtitleExtraDelay,
       holding: state.holding,
       feederTime: state.feeder ? state.feeder.currentTime : null,
       videoTime: dom.video.currentTime,

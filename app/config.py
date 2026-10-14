@@ -62,9 +62,6 @@ def _float_env(name: str, default: float, lo: float, hi: float) -> float:
 
 
 PLAYOUT_DELAY_SECONDS: float = _float_env("PLAYOUT_DELAY_SECONDS", 4.0, 0.0, 10.0)
-# Extra delay applied client-side to subtitles after they arrive. Subtitles naturally lead the
-# dubbed audio by ~0.5-0.8s (useful reading time); set this to align them with the dubbing.
-SUBTITLE_EXTRA_DELAY_SECONDS: float = _float_env("SUBTITLE_EXTRA_DELAY_SECONDS", 0.0, 0.0, 5.0)
 
 # Translated-speech voice presets exposed in the settings UI.
 # "auto" omits speech_config so the model uses its default behaviour (speaker voice replication).
