@@ -29,6 +29,7 @@
   const SUBTITLE_IDLE_HIDE_MS = 6000;
   const SUBTITLE_FINALIZE_MS = 1600;
   const SEEK_RECONNECT_DEBOUNCE_MS = 450;
+  const LEAD_DRIFT_TOLERANCE_S = 0.3; // re-align feeder when it drifts from video + delay by more than this
 
   const DEFAULT_SETTINGS = {
     targetLang: "ko",
@@ -91,6 +92,9 @@
     playerWrap: $("playerWrap"),
     video: $("videoPlayer"),
     playerEmpty: $("playerEmpty"),
+    holdOverlay: $("holdOverlay"),
+    holdCountdown: $("holdCountdown"),
+    playoutDelayTag: $("playoutDelayTag"),
     subtitleOverlay: $("subtitleOverlay"),
     subtitleSource: $("subtitleSource"),
     subtitleTarget: $("subtitleTarget"),
@@ -141,6 +145,17 @@
     audioCtx: null,
     mediaSourceNode: null,
     videoGain: null, // per-video loudness compensation (videos.json "gain")
+    // Lead feeder: hidden <audio> playing PLAYOUT_DELAY seconds ahead of the visible video.
+    // Its output goes only to the capture worklet (never to the speakers).
+    playoutDelay: 0,
+    feeder: null,
+    feederSourceNode: null,
+    feederGain: null,
+    holding: false,
+    holdTimer: null,
+    holdTickTimer: null,
+    resumingFromHold: false,
+    driftTimer: null,
     captureNode: null,
     captureSink: null,
     sourceGain: null,
@@ -276,6 +291,13 @@
       }
       if (cfg.live_translate_model && dom.modelTag) {
         dom.modelTag.textContent = cfg.live_translate_model;
+      }
+      const d = Number(cfg.playout_delay_seconds);
+      state.playoutDelay = Number.isFinite(d) && d > 0 ? Math.min(d, 10) : 0;
+      if (dom.playoutDelayTag) {
+        dom.playoutDelayTag.textContent = state.playoutDelay > 0
+          ? `송출 지연 ${state.playoutDelay.toFixed(1)}s (PLAYOUT_DELAY_SECONDS)`
+          : "송출 지연 없음 (PLAYOUT_DELAY_SECONDS=0)";
       }
     } catch (err) {
       console.warn("Failed to load /api/config, using fallbacks:", err);
@@ -516,8 +538,9 @@
 
     // Video lifecycle
     const v = dom.video;
+    // Only "play" (not "playing") drives session/hold logic: "playing" also fires after the
+    // lead-hold release and would otherwise re-trigger the hold.
     v.addEventListener("play", onVideoPlay);
-    v.addEventListener("playing", onVideoPlay);
     v.addEventListener("pause", onVideoPause);
     v.addEventListener("seeking", onVideoSeeking);
     v.addEventListener("seeked", onVideoSeeked);
@@ -568,15 +591,22 @@
     highlightSelectedVideo();
     dom.playerEmpty.hidden = true;
 
+    clearHold();
     if (!isSame) {
       dom.video.src = `/media/${encodeURIComponent(video.file)}`;
       dom.video.load();
+      if (state.feeder) {
+        state.feeder.src = dom.video.src;
+        state.feeder.load();
+      }
     }
 
     resetTranslationState("비디오 선택");
     ensureAudioGraph();
     if (state.videoGain) {
-      state.videoGain.gain.setTargetAtTime(getVideoGain(video), state.audioCtx.currentTime, 0.02);
+      const g = getVideoGain(video);
+      state.videoGain.gain.setTargetAtTime(g, state.audioCtx.currentTime, 0.02);
+      if (state.feederGain) state.feederGain.gain.setTargetAtTime(g, state.audioCtx.currentTime, 0.02);
     }
 
     // Connect the Live session immediately; audio is only streamed while playing
@@ -605,34 +635,170 @@
     if (!state.userWantsSession || !state.ws || state.ws.readyState > WebSocket.OPEN) {
       startSession();
     }
-    state.isSending = true;
+
+    if (state.resumingFromHold) {
+      // Visible video resuming after the lead hold; feeder is already running ahead
+      state.resumingFromHold = false;
+      state.isSending = true;
+      ensureFeederPlaying();
+      startDriftCorrection();
+      return;
+    }
+    if (state.holding) {
+      // User pressed play during the hold: keep the picture held until the release timer fires
+      try {
+        dom.video.pause();
+      } catch (_) {}
+      return;
+    }
+
+    if (state.playoutDelay > 0) {
+      beginLeadHold();
+    } else {
+      state.isSending = true;
+    }
   }
 
   function onVideoPause() {
-    // Stop streaming source audio but keep the Live session alive
     if (dom.video.ended) return;
+    if (state.holding) return; // our own pause during the lead hold
+    // Stop streaming source audio but keep the Live session alive
     state.isSending = false;
+    stopDriftCorrection();
+    if (state.feeder && !state.feeder.paused) state.feeder.pause();
     if (state.sessionConnected) setStatus("connected", "일시정지");
   }
 
   function onVideoSeeking() {
+    if (state.holding) return;
     state.isSending = false;
     flushTargetAudio();
+    if (state.feeder && !state.feeder.paused) state.feeder.pause();
   }
 
   function onVideoSeeked() {
+    if (state.holding) return;
     // Debounce: scrubbing emits many seeked events
     if (state.seekTimer) clearTimeout(state.seekTimer);
     state.seekTimer = setTimeout(() => {
       state.seekTimer = null;
       resetTranslationState("탐색");
       restartSession("탐색으로 세션 재연결");
-      if (!dom.video.paused && !dom.video.ended) state.isSending = true;
+      if (dom.video.ended) return;
+      if (dom.video.paused) {
+        if (state.feeder) state.feeder.currentTime = dom.video.currentTime;
+        return;
+      }
+      if (state.playoutDelay > 0) {
+        beginLeadHold();
+      } else {
+        state.isSending = true;
+      }
     }, SEEK_RECONNECT_DEBOUNCE_MS);
+  }
+
+  // --- Lead hold: feed the model from `t` right away, show the picture `delay` seconds later.
+
+  function beginLeadHold() {
+    const delay = state.playoutDelay;
+    const video = dom.video;
+    clearHold();
+    const startAt = video.currentTime;
+
+    // 1) feeder starts immediately at the current position and streams to the model
+    if (state.feeder) {
+      state.feeder.currentTime = startAt;
+      ensureFeederPlaying();
+    }
+    state.isSending = true;
+
+    // 2) hold the visible video (our own pause; handlers ignore it while `holding`)
+    state.holding = true;
+    try {
+      video.pause();
+    } catch (_) {}
+    showHold(delay);
+    setStatus("connected", "번역 준비 중...");
+
+    const t0 = Date.now();
+    state.holdTickTimer = setInterval(() => {
+      const left = Math.max(0, delay - (Date.now() - t0) / 1000);
+      if (dom.holdCountdown) dom.holdCountdown.textContent = left.toFixed(1);
+    }, 100);
+
+    // 3) release after `delay` seconds; the feeder is now exactly `delay` ahead
+    state.holdTimer = setTimeout(() => {
+      state.holdTimer = null;
+      clearInterval(state.holdTickTimer);
+      state.holdTickTimer = null;
+      state.holding = false;
+      hideHold();
+      if (video.paused) {
+        state.resumingFromHold = true;
+        video.play().catch(() => {
+          state.resumingFromHold = false;
+          showToast("재생을 다시 눌러 주세요.");
+        });
+      } else {
+        // Already playing (e.g. play() raced the hold): just lock in the lead
+        state.isSending = true;
+        ensureFeederPlaying();
+        startDriftCorrection();
+      }
+    }, delay * 1000);
+  }
+
+  function clearHold() {
+    if (state.holdTimer) clearTimeout(state.holdTimer);
+    if (state.holdTickTimer) clearInterval(state.holdTickTimer);
+    state.holdTimer = null;
+    state.holdTickTimer = null;
+    state.holding = false;
+    state.resumingFromHold = false;
+    hideHold();
+    stopDriftCorrection();
+  }
+
+  function showHold(delay) {
+    if (!dom.holdOverlay) return;
+    if (dom.holdCountdown) dom.holdCountdown.textContent = delay.toFixed(1);
+    dom.holdOverlay.hidden = false;
+  }
+  function hideHold() {
+    if (dom.holdOverlay) dom.holdOverlay.hidden = true;
+  }
+
+  function ensureFeederPlaying() {
+    const f = state.feeder;
+    if (!f) return;
+    if (f.paused) f.play().catch((e) => console.warn("feeder play failed:", e));
+  }
+
+  // Keep feeder = video + delay (within tolerance) while both are playing
+  function startDriftCorrection() {
+    stopDriftCorrection();
+    if (state.playoutDelay <= 0 || !state.feeder) return;
+    state.driftTimer = setInterval(() => {
+      const v = dom.video;
+      const f = state.feeder;
+      if (!f || v.paused || v.ended || state.holding) return;
+      const expected = v.currentTime + state.playoutDelay;
+      if (f.ended || expected >= (f.duration || Infinity)) return;
+      if (Math.abs(f.currentTime - expected) > LEAD_DRIFT_TOLERANCE_S) {
+        f.currentTime = expected;
+      }
+      if (f.paused) ensureFeederPlaying();
+    }, 1000);
+  }
+  function stopDriftCorrection() {
+    if (state.driftTimer) clearInterval(state.driftTimer);
+    state.driftTimer = null;
   }
 
   function onVideoEnded() {
     state.isSending = false;
+    stopDriftCorrection();
+    if (state.feeder && !state.feeder.paused) state.feeder.pause();
     setStatus("connected", "번역 마무리 중...");
     // The model keeps streaming (silent) audio while connected, so wait for a stretch of
     // silence (no audible chunk) rather than an empty queue, with an upper bound.
@@ -684,6 +850,19 @@
     state.mediaSourceNode.connect(state.videoGain);
     state.videoGain.connect(state.sourceGain);
 
+    // Lead feeder (audio-only decode of the same media URL), routed to capture only
+    if (state.playoutDelay > 0) {
+      const feeder = new Audio();
+      feeder.preload = "auto";
+      feeder.playsInline = true;
+      if (dom.video.src) feeder.src = dom.video.src;
+      state.feeder = feeder;
+      state.feederSourceNode = ctx.createMediaElementSource(feeder);
+      state.feederGain = ctx.createGain();
+      state.feederGain.gain.value = getVideoGain(state.currentVideo);
+      state.feederSourceNode.connect(state.feederGain);
+    }
+
     applyGains();
     setupCapture(ctx).catch((err) => {
       console.error("Capture setup failed:", err);
@@ -710,7 +889,9 @@
   }
 
   async function setupCapture(ctx) {
-    const chunkSamples = Math.max(1024, Math.round(ctx.sampleRate * 0.1)); // ~100ms
+    const chunkSamples = Math.max(512, Math.round(ctx.sampleRate * 0.05)); // ~50ms
+    // Model input comes from the feeder when playout delay is enabled, else from the visible video
+    const captureFrom = state.playoutDelay > 0 && state.feederGain ? state.feederGain : state.videoGain;
 
     // Muted sink so the graph keeps pulling even if the user mutes the source
     const sink = ctx.createGain();
@@ -757,7 +938,7 @@
           outputChannelCount: [1],
         });
         node.port.onmessage = (e) => handleCapturedSamples(e.data, ctx.sampleRate);
-        state.videoGain.connect(node);
+        captureFrom.connect(node);
         node.connect(sink);
         state.captureNode = node;
         state.captureReady = true;
@@ -775,7 +956,7 @@
       for (let i = 0; i < ch0.length; i++) mono[i] = ch1 ? (ch0[i] + ch1[i]) * 0.5 : ch0[i];
       handleCapturedSamples(mono, ctx.sampleRate);
     };
-    state.videoGain.connect(script);
+    captureFrom.connect(script);
     script.connect(sink);
     state.captureNode = script;
     state.captureReady = true;
@@ -900,7 +1081,7 @@
     src.connect(state.targetGain);
 
     const now = ctx.currentTime;
-    const startAt = Math.max(now + 0.04, state.nextPlayTime);
+    const startAt = Math.max(now + 0.02, state.nextPlayTime);
     src.start(startAt);
     state.nextPlayTime = startAt + audioBuffer.duration;
     if (isSpeech) {
@@ -1273,6 +1454,11 @@
       sourceGain: state.sourceGain?.gain.value,
       targetGain: state.targetGain?.gain.value,
       targetLines: state.targetLines.length,
+      playoutDelay: state.playoutDelay,
+      holding: state.holding,
+      feederTime: state.feeder ? state.feeder.currentTime : null,
+      videoTime: dom.video.currentTime,
+      lead: state.feeder ? state.feeder.currentTime - dom.video.currentTime : null,
       rxChunks: state.rxChunks,
       rxBytes: state.rxBytes,
       rxLastPeak: state.rxLastPeak,

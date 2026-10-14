@@ -72,6 +72,12 @@
             <div class="subtitle-target" id="subtitleTarget"></div>
           </div>
 
+          <!-- Lead hold: visible video waits PLAYOUT_DELAY seconds while audio is fed ahead -->
+          <div class="hold-overlay" id="holdOverlay" hidden aria-live="polite">
+            <span class="hold-spinner" aria-hidden="true"></span>
+            <span class="hold-text">번역 준비 중 <strong id="holdCountdown">2.0</strong>s</span>
+          </div>
+
           <!-- Empty state -->
           <div class="player-empty" id="playerEmpty">
             <span class="material-symbols-outlined">movie</span>
@@ -191,7 +197,7 @@
       </div>
 
       <div class="modal-footer">
-        <span class="model-tag" id="modelTag">gemini-3.5-live-translate-preview</span>
+        <span class="model-tag"><span id="modelTag">gemini-3.5-live-translate-preview</span> · <span id="playoutDelayTag"></span></span>
         <button type="button" class="btn btn-tonal" id="btnDoneSettings">완료</button>
       </div>
     </div>

@@ -49,6 +49,20 @@ VIDEOS_GCS_BUCKET: str = os.getenv("VIDEOS_GCS_BUCKET", "").strip().replace("gs:
 # Optional object prefix inside the bucket (e.g. "videos"). Empty = bucket root.
 VIDEOS_GCS_PREFIX: str = os.getenv("VIDEOS_GCS_PREFIX", "").strip().strip("/")
 
+# Playout delay (seconds): the visible video is held back by this amount while the
+# model is fed audio from this far ahead, so subtitles/dubbed audio land in sync.
+# Measured steady-state model latency is ~1.0-1.5s (text) / ~2.0-2.5s (audio).
+# 0 disables the lead feeder (translation then trails the video by model latency).
+def _float_env(name: str, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(os.getenv(name, str(default)).strip() or default)
+    except ValueError:
+        v = default
+    return max(lo, min(hi, v))
+
+
+PLAYOUT_DELAY_SECONDS: float = _float_env("PLAYOUT_DELAY_SECONDS", 2.0, 0.0, 10.0)
+
 # Translated-speech voice presets exposed in the settings UI.
 # "auto" omits speech_config so the model uses its default behaviour (speaker voice replication).
 # The remaining entries are the standard Live API prebuilt voices; the Live Translate preview
