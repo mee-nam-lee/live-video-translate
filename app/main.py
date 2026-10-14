@@ -26,7 +26,9 @@ from app.config import (
     GOOGLE_CLOUD_PROJECT,
     INACTIVITY_TIMEOUT_SECONDS,
     LIVE_TRANSLATE_MODEL,
+    DUBBING_EXTRA_DELAY_SECONDS,
     PLAYOUT_DELAY_SECONDS,
+    SUBTITLE_EXTRA_DELAY_SECONDS,
     SUPPORTED_LANGUAGES,
     SUPPORTED_VOICES,
     VALID_VOICE_IDS,
@@ -186,6 +188,8 @@ async def get_config():
         "supported_voices": SUPPORTED_VOICES,
         "video_source": f"gs://{VIDEOS_GCS_BUCKET}/{VIDEOS_GCS_PREFIX}".rstrip("/") if VIDEOS_GCS_BUCKET else "local",
         "playout_delay_seconds": PLAYOUT_DELAY_SECONDS,
+        "subtitle_extra_delay_seconds": SUBTITLE_EXTRA_DELAY_SECONDS,
+        "dubbing_extra_delay_seconds": DUBBING_EXTRA_DELAY_SECONDS,
     }
 
 

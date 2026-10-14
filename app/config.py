@@ -51,8 +51,8 @@ VIDEOS_GCS_PREFIX: str = os.getenv("VIDEOS_GCS_PREFIX", "").strip().strip("/")
 
 # Playout delay (seconds): the visible video is held back by this amount while the
 # model is fed audio from this far ahead, so subtitles/dubbed audio land in sync.
-# Measured steady-state model latency is ~1.0-1.5s (text) / ~2.0-2.5s (audio).
-# 0 disables the lead feeder (translation then trails the video by model latency).
+# Measured on continuous speech (news): dubbed audio trails the source by ~4.0s, subtitles ~3.3s
+# (isolated short utterances are faster, ~2-2.5s). 0 disables the lead feeder.
 def _float_env(name: str, default: float, lo: float, hi: float) -> float:
     try:
         v = float(os.getenv(name, str(default)).strip() or default)
@@ -61,7 +61,11 @@ def _float_env(name: str, default: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
-PLAYOUT_DELAY_SECONDS: float = _float_env("PLAYOUT_DELAY_SECONDS", 2.0, 0.0, 10.0)
+PLAYOUT_DELAY_SECONDS: float = _float_env("PLAYOUT_DELAY_SECONDS", 4.0, 0.0, 10.0)
+# Extra per-channel delays applied client-side after model output arrives. Translated text and
+# audio arrive together, but text tends to lead audio by ~0.5-0.8s; use these to fine-tune each.
+SUBTITLE_EXTRA_DELAY_SECONDS: float = _float_env("SUBTITLE_EXTRA_DELAY_SECONDS", 0.5, 0.0, 5.0)
+DUBBING_EXTRA_DELAY_SECONDS: float = _float_env("DUBBING_EXTRA_DELAY_SECONDS", 0.0, 0.0, 5.0)
 
 # Translated-speech voice presets exposed in the settings UI.
 # "auto" omits speech_config so the model uses its default behaviour (speaker voice replication).

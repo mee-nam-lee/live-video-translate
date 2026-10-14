@@ -37,10 +37,11 @@ GCS 버킷에 등록된 비디오를 선택해 재생하면 음성 언어를 자
    - 비디오 선택 시 세션 연결, **재생 중에만** 오디오 전송, 일시정지 시 전송 중단(세션 유지)
    - 탐색(seek)·비디오 변경·타겟 언어/음성 변경 시 세션 재연결 + 자막/오디오 버퍼 초기화
    - 영상 종료 후 남은 번역 음성이 끝날 때까지 대기한 뒤 세션 종료
-5. **송출 지연(Playout Delay)으로 자막·더빙 싱크** — `PLAYOUT_DELAY_SECONDS` (기본 2.0)
+5. **송출 지연(Playout Delay)으로 자막·더빙 싱크** — `PLAYOUT_DELAY_SECONDS` (기본 4.0)
    - 숨김 `<audio>` 피더가 **재생 위치보다 D초 앞선 오디오**를 모델에 먼저 보내고, 보이는 영상은 재생/탐색 시 D초 동안 "번역 준비 중" 후 시작
    - 모델 지연이 D 안에 흡수되어 자막·더빙이 발화와 거의 동시에 나옴. 방송 송출 지연 버퍼(5–10초)와 같은 원리라 라이브 스트림에도 동일하게 적용 가능
    - `0`으로 두면 즉시 재생하고 번역이 모델 지연만큼 뒤따름
+   - 채널별 미세 조정: `SUBTITLE_EXTRA_DELAY_SECONDS`(기본 0.5, 자막이 음성보다 먼저 도착하는 만큼 보정), `DUBBING_EXTRA_DELAY_SECONDS`(기본 0)
 6. **GCS 기반 비디오 저장소**
    - 비디오 파일과 `videos.json`을 GCS 버킷(`VIDEOS_GCS_BUCKET`)에서 읽어 **8 MiB 단위 206 Partial Content**로 스트리밍 (Cloud Run의 32 MiB 단일 응답 제한 회피, 탐색 지원)
    - 환경변수가 비어 있으면 로컬 `videos/` 폴더로 폴백
@@ -52,13 +53,13 @@ GCS 버킷에 등록된 비디오를 선택해 재생하면 음성 언어를 자
 | 항목 | 측정값 |
 | :--- | :--- |
 | 세션 첫 발화 | 약 **3초** (시동 지연, 1회) |
-| 정상 상태 — 원문 전사 도착 | 발화 시작 **+1.0–1.5s** (말이 끝나기 전 부분 전사 시작) |
-| 정상 상태 — 번역 텍스트 | 발화 시작 **+1.1–2.0s** |
-| 정상 상태 — 번역 음성 | 발화 시작 **+1.8–2.5s** (±0.5s 변동) |
+| 짧은 발화(2.5s) + 무음 반복 | 원문 전사 +1.0–1.5s, 번역 텍스트 +1.1–2.0s, 번역 음성 +1.8–2.5s |
+| **연속 발화(뉴스)** — 더빙 음성 | 원문 대비 **약 4.0s 지연** (원문/더빙 포락선 상호상관으로 측정) |
+| **연속 발화(뉴스)** — 자막 | 더빙보다 약 0.5–0.8s 먼저 도착 |
 | 청크 크기(20–250ms)·VAD 설정·세션 옵션 | 영향 없음 |
 | 텍스트 전용 모드 | 없음 — 번역 텍스트는 음성의 전사본이라 동시에 도착 |
 
-→ API 설정으로는 줄일 수 없으므로 `PLAYOUT_DELAY_SECONDS`(기본 2.0)로 흡수합니다. 자막 위주면 1.5, 더빙 입모양까지 맞추려면 2.5 권장.
+→ API 설정으로는 줄일 수 없으므로 `PLAYOUT_DELAY_SECONDS`(기본 4.0)로 흡수합니다. 4.0에서 더빙이 영상과 ±0.5s 이내로 맞고, `SUBTITLE_EXTRA_DELAY_SECONDS=0.5`로 자막도 더빙에 맞춥니다. 자막만 쓰고 더빙을 끈다면 3.0~3.5로 줄여도 됩니다.
 
 ---
 
@@ -151,7 +152,10 @@ VIDEOS_GCS_BUCKET=live-translate
 VIDEOS_GCS_PREFIX=
 
 # 송출 지연(초). 보이는 영상을 이만큼 늦추고 그만큼 앞선 오디오를 모델에 먼저 보내 자막/더빙 싱크를 맞춤 (0 = 끔)
-PLAYOUT_DELAY_SECONDS=2.0
+PLAYOUT_DELAY_SECONDS=4.0
+# 채널별 추가 지연(초). 자막은 음성보다 먼저 도착하므로 0.5 정도로 더빙에 맞춤
+SUBTITLE_EXTRA_DELAY_SECONDS=0.5
+DUBBING_EXTRA_DELAY_SECONDS=0
 ```
 
 | 변수 | 설명 |
@@ -161,7 +165,9 @@ PLAYOUT_DELAY_SECONDS=2.0
 | `APP_SESSION_HOURS` | 로그인 쿠키 유효 시간 |
 | `VIDEOS_GCS_BUCKET` | 비디오 파일과 `videos.json`을 읽을 GCS 버킷 |
 | `VIDEOS_GCS_PREFIX` | 버킷 내 하위 경로 (선택) |
-| `PLAYOUT_DELAY_SECONDS` | 송출 지연(초, 0–10, 기본 2.0). 0이면 선행 피더 비활성 |
+| `PLAYOUT_DELAY_SECONDS` | 송출 지연(초, 0–10, 기본 4.0). 0이면 선행 피더 비활성 |
+| `SUBTITLE_EXTRA_DELAY_SECONDS` | 자막에만 추가로 거는 지연(초, 기본 0.5) |
+| `DUBBING_EXTRA_DELAY_SECONDS` | 더빙 음성에만 추가로 거는 지연(초, 기본 0) |
 
 ---
 
@@ -194,7 +200,7 @@ Cloud Run 서비스 계정에 **`roles/aiplatform.user`** 와 버킷 읽기 권�
 ```bash
 # .env → env.yaml (예: KEY: "value" 형식)
 python3 - <<'EOF'
-keys=["AUTH_MODE","GOOGLE_CLOUD_PROJECT","GOOGLE_CLOUD_LOCATION","LIVE_TRANSLATE_MODEL","INACTIVITY_TIMEOUT_SECONDS","APP_LOGIN_PASSWORD","APP_SESSION_SECRET","APP_SESSION_HOURS","VIDEOS_GCS_BUCKET","VIDEOS_GCS_PREFIX","PLAYOUT_DELAY_SECONDS"]
+keys=["AUTH_MODE","GOOGLE_CLOUD_PROJECT","GOOGLE_CLOUD_LOCATION","LIVE_TRANSLATE_MODEL","INACTIVITY_TIMEOUT_SECONDS","APP_LOGIN_PASSWORD","APP_SESSION_SECRET","APP_SESSION_HOURS","VIDEOS_GCS_BUCKET","VIDEOS_GCS_PREFIX","PLAYOUT_DELAY_SECONDS","SUBTITLE_EXTRA_DELAY_SECONDS","DUBBING_EXTRA_DELAY_SECONDS"]
 env={l.split("=",1)[0].strip():l.split("=",1)[1].strip() for l in open(".env") if "=" in l and not l.startswith("#")}
 open("env.yaml","w").write("".join(f'{k}: "{env[k]}"\n' for k in keys if env.get(k)))
 EOF

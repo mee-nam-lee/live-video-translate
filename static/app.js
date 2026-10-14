@@ -29,7 +29,7 @@
   const SUBTITLE_IDLE_HIDE_MS = 6000;
   const SUBTITLE_FINALIZE_MS = 1600;
   const SEEK_RECONNECT_DEBOUNCE_MS = 450;
-  const LEAD_DRIFT_TOLERANCE_S = 0.3; // re-align feeder when it drifts from video + delay by more than this
+  const LEAD_DRIFT_TOLERANCE_S = 0.15; // re-align feeder when it drifts from video + delay by more than this
 
   const DEFAULT_SETTINGS = {
     targetLang: "ko",
@@ -148,6 +148,9 @@
     // Lead feeder: hidden <audio> playing PLAYOUT_DELAY seconds ahead of the visible video.
     // Its output goes only to the capture worklet (never to the speakers).
     playoutDelay: 0,
+    subtitleExtraDelay: 0, // seconds, applied to transcription events after arrival
+    dubExtraDelay: 0, // seconds, applied to translated audio scheduling
+    subtitleTimers: new Set(),
     feeder: null,
     feederSourceNode: null,
     feederGain: null,
@@ -292,12 +295,17 @@
       if (cfg.live_translate_model && dom.modelTag) {
         dom.modelTag.textContent = cfg.live_translate_model;
       }
-      const d = Number(cfg.playout_delay_seconds);
-      state.playoutDelay = Number.isFinite(d) && d > 0 ? Math.min(d, 10) : 0;
+      const num = (v, max) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.min(Number(v), max) : 0);
+      state.playoutDelay = num(cfg.playout_delay_seconds, 10);
+      state.subtitleExtraDelay = num(cfg.subtitle_extra_delay_seconds, 5);
+      state.dubExtraDelay = num(cfg.dubbing_extra_delay_seconds, 5);
       if (dom.playoutDelayTag) {
-        dom.playoutDelayTag.textContent = state.playoutDelay > 0
-          ? `송출 지연 ${state.playoutDelay.toFixed(1)}s (PLAYOUT_DELAY_SECONDS)`
-          : "송출 지연 없음 (PLAYOUT_DELAY_SECONDS=0)";
+        const parts = [
+          state.playoutDelay > 0 ? `송출 지연 ${state.playoutDelay.toFixed(1)}s` : "송출 지연 없음",
+          `자막 +${state.subtitleExtraDelay.toFixed(1)}s`,
+          `더빙 +${state.dubExtraDelay.toFixed(1)}s`,
+        ];
+        dom.playoutDelayTag.textContent = parts.join(" · ");
       }
     } catch (err) {
       console.warn("Failed to load /api/config, using fallbacks:", err);
@@ -1081,7 +1089,8 @@
     src.connect(state.targetGain);
 
     const now = ctx.currentTime;
-    const startAt = Math.max(now + 0.02, state.nextPlayTime);
+    // Extra dubbing delay shifts the whole translated-audio stream (contiguity is preserved)
+    const startAt = Math.max(now + 0.02 + state.dubExtraDelay, state.nextPlayTime);
     src.start(startAt);
     state.nextPlayTime = startAt + audioBuffer.duration;
     if (isSpeech) {
@@ -1269,16 +1278,18 @@
       }
       case "input_transcription": {
         if (msg.language_code) updateDetectedLanguage(msg.language_code);
-        if (msg.text) updateSourceSubtitle(msg.text, Boolean(msg.finished), Boolean(msg.interim));
         if (!dom.video.paused) setStatus("connected", "실시간 번역 중");
+        if (msg.text) {
+          deferSubtitle(() => updateSourceSubtitle(msg.text, Boolean(msg.finished), Boolean(msg.interim)));
+        }
         break;
       }
       case "output_transcription": {
-        if (msg.text) updateTargetSubtitle(msg.text, Boolean(msg.finished));
+        if (msg.text) deferSubtitle(() => updateTargetSubtitle(msg.text, Boolean(msg.finished)));
         break;
       }
       case "turn_complete": {
-        if (msg.turn_complete) finalizeTargetSubtitle();
+        if (msg.turn_complete) deferSubtitle(finalizeTargetSubtitle);
         break;
       }
       case "go_away": {
@@ -1361,7 +1372,23 @@
     renderSubtitles();
   }
 
+  // Apply the configured extra subtitle delay (0 = immediate), preserving event order
+  function deferSubtitle(fn) {
+    const ms = state.subtitleExtraDelay * 1000;
+    if (ms <= 0) {
+      fn();
+      return;
+    }
+    const id = setTimeout(() => {
+      state.subtitleTimers.delete(id);
+      fn();
+    }, ms);
+    state.subtitleTimers.add(id);
+  }
+
   function clearSubtitles() {
+    state.subtitleTimers.forEach((id) => clearTimeout(id));
+    state.subtitleTimers.clear();
     if (state.activeTarget?.timer) clearTimeout(state.activeTarget.timer);
     state.activeTarget = null;
     state.targetLines = [];
@@ -1443,6 +1470,8 @@
   // =========================================================================
   // Read-only debug hook (DevTools): window.__lvt.debug()
   window.__lvt = {
+    // Diagnostics only: expose graph nodes so an AnalyserNode can be attached from DevTools
+    nodes: () => ({ ctx: state.audioCtx, sourceGain: state.sourceGain, targetGain: state.targetGain, video: dom.video, feeder: state.feeder }),
     debug: () => ({
       ctxState: state.audioCtx?.state,
       sampleRate: state.audioCtx?.sampleRate,
@@ -1455,6 +1484,8 @@
       targetGain: state.targetGain?.gain.value,
       targetLines: state.targetLines.length,
       playoutDelay: state.playoutDelay,
+      subtitleExtraDelay: state.subtitleExtraDelay,
+      dubExtraDelay: state.dubExtraDelay,
       holding: state.holding,
       feederTime: state.feeder ? state.feeder.currentTime : null,
       videoTime: dom.video.currentTime,
